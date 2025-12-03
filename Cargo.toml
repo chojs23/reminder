@@ -1,0 +1,23 @@
+[package]
+name = "reminder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "serde",
+] }
+eframe = { version = "0.33", default-features = false, features = [
+  "glow",
+  "default_fonts",
+] }
+egui_extras = "0.33"
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "json",
+  "rustls-tls",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"

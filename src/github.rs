@@ -1,0 +1,240 @@
+use chrono::{DateTime, Utc};
+use reqwest::{
+    blocking::Client,
+    header::{ACCEPT, USER_AGENT},
+};
+use serde::Deserialize;
+use thiserror::Error;
+
+use crate::domain::{
+    GitHubAccount, InboxSnapshot, MentionKind, MentionThread, NotificationItem, ReviewRequest,
+    ReviewSummary,
+};
+
+const GH_NOTIFICATIONS: &str = "https://api.github.com/notifications";
+const GH_SEARCH_ISSUES: &str = "https://api.github.com/search/issues";
+const USER_AGENT_HEADER: &str = "reminder-egui/0.1";
+
+pub fn build_client() -> Result<Client, FetchError> {
+    Client::builder()
+        .user_agent(USER_AGENT_HEADER)
+        .build()
+        .map_err(FetchError::Http)
+}
+
+pub fn fetch_inbox(client: &Client, profile: &GitHubAccount) -> Result<InboxSnapshot, FetchError> {
+    if profile.token.is_empty() {
+        return Err(FetchError::MissingToken);
+    }
+
+    let notifications = fetch_notifications(client, profile)?;
+    let review_requests = fetch_review_requests(client, profile)?;
+    let mentions = fetch_mentions(client, profile)?;
+    let recent_reviews = fetch_recent_reviews(client, profile)?;
+
+    Ok(InboxSnapshot {
+        notifications,
+        review_requests,
+        mentions,
+        recent_reviews,
+        fetched_at: Utc::now(),
+    })
+}
+
+fn fetch_notifications(
+    client: &Client,
+    profile: &GitHubAccount,
+) -> Result<Vec<NotificationItem>, FetchError> {
+    let response: Vec<NotificationResponse> = client
+        .get(GH_NOTIFICATIONS)
+        .header(USER_AGENT, USER_AGENT_HEADER)
+        .header(ACCEPT, "application/vnd.github+json")
+        .bearer_auth(&profile.token)
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    Ok(response
+        .into_iter()
+        .map(|item| NotificationItem {
+            _id: item.id,
+            repo: item.repository.full_name,
+            title: item.subject.title,
+            url: item
+                .subject
+                .url
+                .as_deref()
+                .map(|url| url.replace("api.github.com/repos", "github.com")),
+            reason: item.reason,
+            updated_at: item.updated_at,
+        })
+        .collect())
+}
+
+fn fetch_review_requests(
+    client: &Client,
+    profile: &GitHubAccount,
+) -> Result<Vec<ReviewRequest>, FetchError> {
+    let query = format!("is:pr state:open review-requested:{}", profile.login);
+    let response: SearchResponse = client
+        .get(GH_SEARCH_ISSUES)
+        .query(&[("q", query.as_str())])
+        .header(USER_AGENT, USER_AGENT_HEADER)
+        .header(ACCEPT, "application/vnd.github+json")
+        .bearer_auth(&profile.token)
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    Ok(response
+        .items
+        .into_iter()
+        .map(|item| ReviewRequest {
+            _id: item.id,
+            repo: extract_repo_name(&item.repository_url),
+            title: format!("#{} {}", item.number, item.title),
+            url: item.html_url,
+            updated_at: item.updated_at,
+            requested_by: item.user.map(|user| user.login),
+        })
+        .collect())
+}
+
+fn fetch_mentions(
+    client: &Client,
+    profile: &GitHubAccount,
+) -> Result<Vec<MentionThread>, FetchError> {
+    let query = format!("mentions:{} is:open", profile.login);
+    let response: SearchResponse = client
+        .get(GH_SEARCH_ISSUES)
+        .query(&[
+            ("q", query.as_str()),
+            ("sort", "updated"),
+            ("order", "desc"),
+        ])
+        .header(USER_AGENT, USER_AGENT_HEADER)
+        .header(ACCEPT, "application/vnd.github+json")
+        .bearer_auth(&profile.token)
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    Ok(response
+        .items
+        .into_iter()
+        .map(|item| {
+            let kind = classify_thread(&item.html_url);
+            MentionThread {
+                _id: item.id,
+                repo: extract_repo_name(&item.repository_url),
+                title: format!("#{} {}", item.number, item.title),
+                url: item.html_url,
+                updated_at: item.updated_at,
+                kind,
+            }
+        })
+        .collect())
+}
+
+fn fetch_recent_reviews(
+    client: &Client,
+    profile: &GitHubAccount,
+) -> Result<Vec<ReviewSummary>, FetchError> {
+    let query = format!("is:pr reviewed-by:{}", profile.login);
+    let response: SearchResponse = client
+        .get(GH_SEARCH_ISSUES)
+        .query(&[
+            ("q", query.as_str()),
+            ("sort", "updated"),
+            ("order", "desc"),
+        ])
+        .header(USER_AGENT, USER_AGENT_HEADER)
+        .header(ACCEPT, "application/vnd.github+json")
+        .bearer_auth(&profile.token)
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    Ok(response
+        .items
+        .into_iter()
+        .map(|item| ReviewSummary {
+            _id: item.id,
+            repo: extract_repo_name(&item.repository_url),
+            title: format!("#{} {}", item.number, item.title),
+            url: item.html_url,
+            updated_at: item.updated_at,
+            state: item.state,
+        })
+        .collect())
+}
+
+fn classify_thread(url: &str) -> MentionKind {
+    if url.contains("/pull/") {
+        MentionKind::PullRequest
+    } else {
+        MentionKind::Issue
+    }
+}
+
+fn extract_repo_name(api_url: &str) -> String {
+    api_url
+        .trim_start_matches("https://api.github.com/repos/")
+        .to_owned()
+}
+
+pub type FetchOutcome = Result<InboxSnapshot, FetchError>;
+
+#[derive(Error, Debug)]
+pub enum FetchError {
+    #[error("GitHub API request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("Account token is missing")]
+    MissingToken,
+    #[error("Background worker disconnected before returning a result")]
+    BackgroundWorkerGone,
+}
+
+// Response payloads ---------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct NotificationResponse {
+    id: String,
+    reason: String,
+    updated_at: DateTime<Utc>,
+    subject: NotificationSubject,
+    repository: NotificationRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationSubject {
+    title: String,
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationRepository {
+    full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    items: Vec<SearchItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchItem {
+    id: u64,
+    html_url: String,
+    repository_url: String,
+    title: String,
+    number: u64,
+    updated_at: DateTime<Utc>,
+    user: Option<GitHubUser>,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubUser {
+    login: String,
+}
