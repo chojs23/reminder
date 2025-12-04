@@ -82,11 +82,14 @@ fn fetch_notifications(
             thread_id: item.id,
             repo: item.repository.full_name,
             title: item.subject.title,
-            url: item
-                .subject
-                .url
-                .as_deref()
-                .map(|url| url.replace("api.github.com/repos", "github.com")),
+            url: item.subject.url.as_deref().map(|url| {
+                let mut html = url.replace("api.github.com/repos", "github.com");
+                // GitHub API uses `/pulls/` in the notifications subject URL, but the
+                // human-facing page lives at `/pull/`. Normalize so hyperlinks open
+                // the right PR page instead of the list view.
+                html = html.replace("/pulls/", "/pull/");
+                html
+            }),
             reason: item.reason,
             updated_at: item.updated_at,
             unread: item.unread,

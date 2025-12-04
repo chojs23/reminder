@@ -325,9 +325,8 @@ fn render_account_body(group: &mut egui::Ui, account: &mut AccountState) {
         let filter = SearchFilter::new(&account.search_query);
         let actions = {
             let inflight_done = account.inflight_done.clone();
-            let done_threads = account.done_threads.clone();
             let inbox = account.inbox.as_ref().expect("checked above");
-            render_account_sections(group, inbox, &filter, &inflight_done, &done_threads)
+            render_account_sections(group, inbox, &filter, &inflight_done)
         };
         for action in actions {
             match action {
@@ -342,22 +341,20 @@ fn render_account_sections(
     inbox: &InboxSnapshot,
     filter: &SearchFilter,
     inflight_done: &HashSet<String>,
-    done_threads: &HashSet<String>,
 ) -> Vec<AccountAction> {
     const REVIEW_REQUEST_REASON: &str = "review_requested";
     const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
 
     // Keep "seen" notifications in their contextual buckets so reviewers can finish
-    // sweeping the list, and reserve the Done section for entries explicitly archived
-    // via the Done button (tracked in done_threads).
+    // sweeping the list, and reserve the Done section for entries GitHub considers
+    // read (either via this app or elsewhere).
     let mut actions = Vec::new();
     let review_requests: Vec<_> = inbox
         .notifications
         .iter()
-        .filter(|item| {
-            item.reason == REVIEW_REQUEST_REASON && !done_threads.contains(&item.thread_id)
-        })
+        .filter(|item| item.reason == REVIEW_REQUEST_REASON && item.unread)
         .collect();
+
     actions.extend(render_notification_section(
         group,
         "Review requests",
@@ -372,10 +369,7 @@ fn render_account_sections(
     let mentions: Vec<_> = inbox
         .notifications
         .iter()
-        .filter(|item| {
-            MENTION_REASONS.contains(&item.reason.as_str())
-                && !done_threads.contains(&item.thread_id)
-        })
+        .filter(|item| MENTION_REASONS.contains(&item.reason.as_str()) && item.unread)
         .collect();
     actions.extend(render_notification_section(
         group,
@@ -394,7 +388,7 @@ fn render_account_sections(
         .filter(|item| {
             item.reason != REVIEW_REQUEST_REASON
                 && !MENTION_REASONS.contains(&item.reason.as_str())
-                && !done_threads.contains(&item.thread_id)
+                && item.unread
         })
         .collect();
     actions.extend(render_notification_section(
@@ -411,7 +405,7 @@ fn render_account_sections(
     let done_items: Vec<_> = inbox
         .notifications
         .iter()
-        .filter(|item| done_threads.contains(&item.thread_id))
+        .filter(|item| !item.unread)
         .collect();
     actions.extend(render_notification_section(
         group,
@@ -498,7 +492,6 @@ struct AccountState {
     expanded: bool,
     search_query: String,
     inflight_done: HashSet<String>,
-    done_threads: HashSet<String>,
 }
 
 impl AccountState {
@@ -512,7 +505,6 @@ impl AccountState {
             expanded: true,
             search_query: String::new(),
             inflight_done: HashSet::new(),
-            done_threads: HashSet::new(),
         }
     }
 
@@ -530,7 +522,6 @@ impl AccountState {
                     Ok(inbox) => {
                         self.inbox = Some(inbox);
                         self.last_error = None;
-                        self.reconcile_done_threads();
                     }
                     Err(err) => {
                         self.last_error = Some(err.to_string());
@@ -563,17 +554,6 @@ impl AccountState {
         }
     }
 
-    fn reconcile_done_threads(&mut self) {
-        // Drop stale Done markers once GitHub stops returning a thread so we do not
-        // accidentally hide unrelated future notifications that might reuse an ID.
-        if let Some(inbox) = &self.inbox {
-            self.done_threads
-                .retain(|id| inbox.notifications.iter().any(|item| &item.thread_id == id));
-        } else {
-            self.done_threads.clear();
-        }
-    }
-
     fn handle_action_success(&mut self, thread_id: &str) {
         if let Some(inbox) = &mut self.inbox {
             if let Some(item) = inbox
@@ -584,9 +564,6 @@ impl AccountState {
                 item.unread = false;
             }
         }
-        // Track the archived thread locally so that it moves to the Done list even
-        // before the next GitHub sync confirms the change.
-        self.done_threads.insert(thread_id.to_owned());
         self.inflight_done.remove(thread_id);
     }
 
