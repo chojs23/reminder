@@ -12,6 +12,7 @@ use crate::domain::{
 };
 
 const GH_NOTIFICATIONS: &str = "https://api.github.com/notifications";
+const GH_NOTIFICATION_THREAD: &str = "https://api.github.com/notifications/threads";
 const GH_SEARCH_ISSUES: &str = "https://api.github.com/search/issues";
 const USER_AGENT_HEADER: &str = "reminder-egui/0.1";
 
@@ -41,6 +42,26 @@ pub fn fetch_inbox(client: &Client, profile: &GitHubAccount) -> Result<InboxSnap
     })
 }
 
+pub fn mark_notification_done(
+    client: &Client,
+    profile: &GitHubAccount,
+    thread_id: &str,
+) -> Result<(), FetchError> {
+    if profile.token.is_empty() {
+        return Err(FetchError::MissingToken);
+    }
+
+    let url = format!("{GH_NOTIFICATION_THREAD}/{thread_id}");
+    client
+        .delete(url)
+        .header(USER_AGENT, USER_AGENT_HEADER)
+        .header(ACCEPT, "application/vnd.github+json")
+        .bearer_auth(&profile.token)
+        .send()?
+        .error_for_status()?;
+    Ok(())
+}
+
 fn fetch_notifications(
     client: &Client,
     profile: &GitHubAccount,
@@ -57,7 +78,7 @@ fn fetch_notifications(
     Ok(response
         .into_iter()
         .map(|item| NotificationItem {
-            _id: item.id,
+            thread_id: item.id,
             repo: item.repository.full_name,
             title: item.subject.title,
             url: item

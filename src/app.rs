@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
@@ -153,6 +154,7 @@ impl ReminderApp {
     fn poll_jobs(&mut self) {
         for account in &mut self.accounts {
             account.poll_job();
+            account.poll_action_jobs();
         }
     }
 
@@ -311,7 +313,7 @@ fn render_account_status(group: &mut egui::Ui, account: &AccountState) {
     }
 }
 
-fn render_account_body(group: &mut egui::Ui, account: &AccountState) {
+fn render_account_body(group: &mut egui::Ui, account: &mut AccountState) {
     if !account.expanded {
         if account.inbox.is_none() {
             group.separator();
@@ -320,14 +322,29 @@ fn render_account_body(group: &mut egui::Ui, account: &AccountState) {
         return;
     }
 
-    if let Some(inbox) = &account.inbox {
+    if account.inbox.is_some() {
         group.separator();
         let filter = SearchFilter::new(&account.search_query);
-        render_account_sections(group, inbox, &filter);
+        let actions = {
+            let inflight_done = account.inflight_done.clone();
+            let inbox = account.inbox.as_ref().expect("checked above");
+            render_account_sections(group, inbox, &filter, &inflight_done)
+        };
+        for action in actions {
+            match action {
+                AccountAction::MarkNotificationDone(id) => account.request_mark_done(id),
+            }
+        }
     }
 }
 
-fn render_account_sections(group: &mut egui::Ui, inbox: &InboxSnapshot, filter: &SearchFilter) {
+fn render_account_sections(
+    group: &mut egui::Ui,
+    inbox: &InboxSnapshot,
+    filter: &SearchFilter,
+    inflight_done: &HashSet<String>,
+) -> Vec<AccountAction> {
+    let mut actions = Vec::new();
     group.collapsing("Unanswered review requests", |section| {
         draw_review_requests(section, &inbox.review_requests, filter);
     });
@@ -341,8 +358,14 @@ fn render_account_sections(group: &mut egui::Ui, inbox: &InboxSnapshot, filter: 
     });
     group.separator();
     group.collapsing("Notifications", |section| {
-        draw_notifications(section, &inbox.notifications, filter);
+        actions.extend(draw_notifications(
+            section,
+            &inbox.notifications,
+            filter,
+            inflight_done,
+        ));
     });
+    actions
 }
 
 // -----------------------------------------------------------------------------
@@ -413,8 +436,10 @@ struct AccountState {
     inbox: Option<InboxSnapshot>,
     last_error: Option<String>,
     pending_job: Option<PendingJob>,
+    pending_actions: Vec<NotificationActionJob>,
     expanded: bool,
     search_query: String,
+    inflight_done: HashSet<String>,
 }
 
 impl AccountState {
@@ -424,8 +449,10 @@ impl AccountState {
             inbox: None,
             last_error: None,
             pending_job: None,
+            pending_actions: Vec::new(),
             expanded: true,
             search_query: String::new(),
+            inflight_done: HashSet::new(),
         }
     }
 
@@ -450,6 +477,48 @@ impl AccountState {
                 }
             }
         }
+    }
+
+    fn poll_action_jobs(&mut self) {
+        let mut finished = Vec::new();
+        self.pending_actions.retain(|job| match job.try_take() {
+            None => true,
+            Some(result) => {
+                finished.push(result);
+                false
+            }
+        });
+
+        for outcome in finished {
+            match outcome {
+                Ok(thread_id) => self.handle_action_success(&thread_id),
+                Err((thread_id, err)) => {
+                    self.last_error = Some(err);
+                    if let Some(id) = thread_id {
+                        self.inflight_done.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_action_success(&mut self, thread_id: &str) {
+        if let Some(inbox) = &mut self.inbox {
+            inbox
+                .notifications
+                .retain(|item| item.thread_id != thread_id);
+        }
+        self.inflight_done.remove(thread_id);
+    }
+
+    fn request_mark_done(&mut self, thread_id: String) {
+        if self.inflight_done.contains(&thread_id) {
+            return;
+        }
+        let profile = self.profile.clone();
+        let job = NotificationActionJob::mark_done(profile, thread_id.clone());
+        self.pending_actions.push(job);
+        self.inflight_done.insert(thread_id);
     }
 
     fn needs_refresh(&self, threshold: Duration) -> bool {
@@ -489,11 +558,53 @@ impl PendingJob {
     }
 }
 
+type NotificationActionResult = Result<String, (Option<String>, String)>;
+
+struct NotificationActionJob {
+    receiver: Receiver<NotificationActionResult>,
+}
+
+impl NotificationActionJob {
+    fn mark_done(profile: GitHubAccount, thread_id: String) -> Self {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = Self::mark_done_worker(profile, thread_id);
+            let _ = tx.send(outcome);
+        });
+        Self { receiver: rx }
+    }
+
+    fn mark_done_worker(profile: GitHubAccount, thread_id: String) -> NotificationActionResult {
+        let client =
+            github::build_client().map_err(|err| (Some(thread_id.clone()), err.to_string()))?;
+        github::mark_notification_done(&client, &profile, &thread_id)
+            .map_err(|err| (Some(thread_id.clone()), err.to_string()))?;
+        Ok(thread_id)
+    }
+
+    fn try_take(&self) -> Option<NotificationActionResult> {
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err((
+                None,
+                "Notification action worker disconnected".to_owned(),
+            ))),
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // UI helpers
 // -----------------------------------------------------------------------------
 
-fn draw_notifications(ui: &mut egui::Ui, items: &[NotificationItem], filter: &SearchFilter) {
+fn draw_notifications(
+    ui: &mut egui::Ui,
+    items: &[NotificationItem],
+    filter: &SearchFilter,
+    inflight_done: &HashSet<String>,
+) -> Vec<AccountAction> {
+    let mut actions = Vec::new();
     let rows: Vec<_> = items
         .iter()
         .filter(|item| filter.matches_any(&[&item.repo, &item.title, &item.reason]))
@@ -504,7 +615,7 @@ fn draw_notifications(ui: &mut egui::Ui, items: &[NotificationItem], filter: &Se
         } else {
             "No matches for current search."
         });
-        return;
+        return actions;
     }
 
     TableBuilder::new(ui)
@@ -512,6 +623,7 @@ fn draw_notifications(ui: &mut egui::Ui, items: &[NotificationItem], filter: &Se
         .column(Column::initial(120.0).resizable(true))
         .column(Column::remainder())
         .column(Column::initial(150.0))
+        .column(Column::initial(90.0))
         .header(20.0, |mut header| {
             header.col(|ui| {
                 ui.strong("Repository");
@@ -522,9 +634,13 @@ fn draw_notifications(ui: &mut egui::Ui, items: &[NotificationItem], filter: &Se
             header.col(|ui| {
                 ui.strong("Updated");
             });
+            header.col(|ui| {
+                ui.strong("Actions");
+            });
         })
         .body(|mut body| {
             for item in rows {
+                let thread_id = item.thread_id.clone();
                 body.row(24.0, |mut row| {
                     row.col(|ui| {
                         ui.label(&item.repo);
@@ -540,9 +656,20 @@ fn draw_notifications(ui: &mut egui::Ui, items: &[NotificationItem], filter: &Se
                     row.col(|ui| {
                         ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
                     });
+                    row.col(|ui| {
+                        let busy = inflight_done.contains(&thread_id);
+                        let button = ui.add_enabled(!busy, egui::Button::new("Done"));
+                        if button.clicked() {
+                            actions.push(AccountAction::MarkNotificationDone(thread_id.clone()));
+                        }
+                        if busy {
+                            ui.small("Working…");
+                        }
+                    });
                 });
             }
         });
+    actions
 }
 
 fn draw_review_requests(ui: &mut egui::Ui, items: &[ReviewRequest], filter: &SearchFilter) {
@@ -719,6 +846,10 @@ fn draw_recent_reviews(ui: &mut egui::Ui, items: &[ReviewSummary], filter: &Sear
 // -----------------------------------------------------------------------------
 // Supporting structs
 // -----------------------------------------------------------------------------
+
+enum AccountAction {
+    MarkNotificationDone(String),
+}
 
 #[derive(Default)]
 struct AccountForm {

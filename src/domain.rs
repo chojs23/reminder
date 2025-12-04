@@ -19,7 +19,7 @@ pub struct InboxSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct NotificationItem {
-    pub _id: String,
+    pub thread_id: String,
     pub repo: String,
     pub title: String,
     pub url: Option<String>,
