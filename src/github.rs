@@ -68,6 +68,7 @@ fn fetch_notifications(
 ) -> Result<Vec<NotificationItem>, FetchError> {
     let response: Vec<NotificationResponse> = client
         .get(GH_NOTIFICATIONS)
+        .query(&[("all", "true")])
         .header(USER_AGENT, USER_AGENT_HEADER)
         .header(ACCEPT, "application/vnd.github+json")
         .bearer_auth(&profile.token)
@@ -88,6 +89,7 @@ fn fetch_notifications(
                 .map(|url| url.replace("api.github.com/repos", "github.com")),
             reason: item.reason,
             updated_at: item.updated_at,
+            unread: item.unread,
         })
         .collect())
 }
@@ -223,6 +225,7 @@ struct NotificationResponse {
     id: String,
     reason: String,
     updated_at: DateTime<Utc>,
+    unread: bool,
     subject: NotificationSubject,
     repository: NotificationRepository,
 }

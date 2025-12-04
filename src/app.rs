@@ -9,14 +9,12 @@ use std::{
 use chrono::Utc;
 use eframe::{
     App, CreationContext, Frame,
-    egui::{self, Context, FontData, FontDefinitions, FontFamily, Layout},
+    egui::{self, Context, FontData, FontDefinitions, FontFamily, Layout, RichText},
 };
 use egui_extras::{Column, TableBuilder};
 
 use crate::{
-    domain::{
-        GitHubAccount, InboxSnapshot, MentionThread, NotificationItem, ReviewRequest, ReviewSummary,
-    },
+    domain::{GitHubAccount, InboxSnapshot, NotificationItem},
     github::{self, FetchError},
     storage::AccountStore,
 };
@@ -327,8 +325,9 @@ fn render_account_body(group: &mut egui::Ui, account: &mut AccountState) {
         let filter = SearchFilter::new(&account.search_query);
         let actions = {
             let inflight_done = account.inflight_done.clone();
+            let done_threads = account.done_threads.clone();
             let inbox = account.inbox.as_ref().expect("checked above");
-            render_account_sections(group, inbox, &filter, &inflight_done)
+            render_account_sections(group, inbox, &filter, &inflight_done, &done_threads)
         };
         for action in actions {
             match action {
@@ -343,28 +342,87 @@ fn render_account_sections(
     inbox: &InboxSnapshot,
     filter: &SearchFilter,
     inflight_done: &HashSet<String>,
+    done_threads: &HashSet<String>,
 ) -> Vec<AccountAction> {
+    const REVIEW_REQUEST_REASON: &str = "review_requested";
+    const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
+
+    // Keep "seen" notifications in their contextual buckets so reviewers can finish
+    // sweeping the list, and reserve the Done section for entries explicitly archived
+    // via the Done button (tracked in done_threads).
     let mut actions = Vec::new();
-    group.collapsing("Unanswered review requests", |section| {
-        draw_review_requests(section, &inbox.review_requests, filter);
-    });
+    let review_requests: Vec<_> = inbox
+        .notifications
+        .iter()
+        .filter(|item| {
+            item.reason == REVIEW_REQUEST_REASON && !done_threads.contains(&item.thread_id)
+        })
+        .collect();
+    actions.extend(render_notification_section(
+        group,
+        "Review requests",
+        review_requests,
+        "No pending review requests.",
+        filter,
+        inflight_done,
+        true,
+    ));
     group.separator();
-    group.collapsing("Mentions", |section| {
-        draw_mentions(section, &inbox.mentions, filter);
-    });
+
+    let mentions: Vec<_> = inbox
+        .notifications
+        .iter()
+        .filter(|item| {
+            MENTION_REASONS.contains(&item.reason.as_str())
+                && !done_threads.contains(&item.thread_id)
+        })
+        .collect();
+    actions.extend(render_notification_section(
+        group,
+        "Mentions",
+        mentions,
+        "No recent mentions.",
+        filter,
+        inflight_done,
+        true,
+    ));
     group.separator();
-    group.collapsing("Recently reviewed pull requests", |section| {
-        draw_recent_reviews(section, &inbox.recent_reviews, filter);
-    });
+
+    let other_unread: Vec<_> = inbox
+        .notifications
+        .iter()
+        .filter(|item| {
+            item.reason != REVIEW_REQUEST_REASON
+                && !MENTION_REASONS.contains(&item.reason.as_str())
+                && !done_threads.contains(&item.thread_id)
+        })
+        .collect();
+    actions.extend(render_notification_section(
+        group,
+        "Notifications",
+        other_unread,
+        "You're all caught up 🎉",
+        filter,
+        inflight_done,
+        true,
+    ));
     group.separator();
-    group.collapsing("Notifications", |section| {
-        actions.extend(draw_notifications(
-            section,
-            &inbox.notifications,
-            filter,
-            inflight_done,
-        ));
-    });
+
+    let done_items: Vec<_> = inbox
+        .notifications
+        .iter()
+        .filter(|item| done_threads.contains(&item.thread_id))
+        .collect();
+    actions.extend(render_notification_section(
+        group,
+        "Done notifications",
+        done_items,
+        "Nothing marked done yet.",
+        filter,
+        inflight_done,
+        false,
+    ));
+
     actions
 }
 
@@ -440,6 +498,7 @@ struct AccountState {
     expanded: bool,
     search_query: String,
     inflight_done: HashSet<String>,
+    done_threads: HashSet<String>,
 }
 
 impl AccountState {
@@ -453,6 +512,7 @@ impl AccountState {
             expanded: true,
             search_query: String::new(),
             inflight_done: HashSet::new(),
+            done_threads: HashSet::new(),
         }
     }
 
@@ -470,6 +530,7 @@ impl AccountState {
                     Ok(inbox) => {
                         self.inbox = Some(inbox);
                         self.last_error = None;
+                        self.reconcile_done_threads();
                     }
                     Err(err) => {
                         self.last_error = Some(err.to_string());
@@ -502,12 +563,30 @@ impl AccountState {
         }
     }
 
+    fn reconcile_done_threads(&mut self) {
+        // Drop stale Done markers once GitHub stops returning a thread so we do not
+        // accidentally hide unrelated future notifications that might reuse an ID.
+        if let Some(inbox) = &self.inbox {
+            self.done_threads
+                .retain(|id| inbox.notifications.iter().any(|item| &item.thread_id == id));
+        } else {
+            self.done_threads.clear();
+        }
+    }
+
     fn handle_action_success(&mut self, thread_id: &str) {
         if let Some(inbox) = &mut self.inbox {
-            inbox
+            if let Some(item) = inbox
                 .notifications
-                .retain(|item| item.thread_id != thread_id);
+                .iter_mut()
+                .find(|item| item.thread_id == thread_id)
+            {
+                item.unread = false;
+            }
         }
+        // Track the archived thread locally so that it moves to the Done list even
+        // before the next GitHub sync confirms the change.
+        self.done_threads.insert(thread_id.to_owned());
         self.inflight_done.remove(thread_id);
     }
 
@@ -598,23 +677,60 @@ impl NotificationActionJob {
 // UI helpers
 // -----------------------------------------------------------------------------
 
-fn draw_notifications(
-    ui: &mut egui::Ui,
-    items: &[NotificationItem],
+fn render_notification_section<'a>(
+    group: &mut egui::Ui,
+    title: &str,
+    subset: Vec<&'a NotificationItem>,
+    empty_label: &'static str,
     filter: &SearchFilter,
     inflight_done: &HashSet<String>,
+    allow_done_action: bool,
+) -> Vec<AccountAction> {
+    if subset.is_empty() {
+        group.collapsing(title, |section| {
+            section.weak(empty_label);
+        });
+        return Vec::new();
+    }
+
+    let mut actions = Vec::new();
+    group.collapsing(title, |section| {
+        actions.extend(draw_notifications(
+            section,
+            &subset,
+            filter,
+            inflight_done,
+            allow_done_action,
+        ));
+    });
+    actions
+}
+
+// Seen-but-not-done notifications stay visible but get a softer palette so they do
+// not compete with fresh unread rows.
+fn notification_text(ui: &egui::Ui, text: impl Into<String>, seen: bool) -> RichText {
+    let mut content = RichText::new(text.into());
+    if seen {
+        content = content.color(ui.visuals().weak_text_color());
+    }
+    content
+}
+
+fn draw_notifications(
+    ui: &mut egui::Ui,
+    items: &[&NotificationItem],
+    filter: &SearchFilter,
+    inflight_done: &HashSet<String>,
+    allow_done_action: bool,
 ) -> Vec<AccountAction> {
     let mut actions = Vec::new();
     let rows: Vec<_> = items
         .iter()
+        .copied()
         .filter(|item| filter.matches_any(&[&item.repo, &item.title, &item.reason]))
         .collect();
     if rows.is_empty() {
-        ui.weak(if items.is_empty() {
-            "You're all caught up 🎉"
-        } else {
-            "No matches for current search."
-        });
+        ui.weak("No matches for current search.");
         return actions;
     }
 
@@ -641,206 +757,50 @@ fn draw_notifications(
         .body(|mut body| {
             for item in rows {
                 let thread_id = item.thread_id.clone();
+                let seen = !item.unread;
                 body.row(24.0, |mut row| {
                     row.col(|ui| {
-                        ui.label(&item.repo);
+                        ui.label(notification_text(ui, &item.repo, seen));
                     });
                     row.col(|ui| {
+                        let subject = notification_text(ui, &item.title, seen);
                         if let Some(url) = &item.url {
-                            ui.hyperlink_to(&item.title, url);
+                            ui.hyperlink_to(subject, url);
                         } else {
-                            ui.label(&item.title);
+                            ui.label(subject);
                         }
-                        ui.small(format!("Reason: {}", &item.reason));
+                        ui.small(notification_text(
+                            ui,
+                            format!("Reason: {}", &item.reason),
+                            seen,
+                        ));
                     });
                     row.col(|ui| {
-                        ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
+                        ui.label(notification_text(
+                            ui,
+                            item.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+                            seen,
+                        ));
                     });
                     row.col(|ui| {
-                        let busy = inflight_done.contains(&thread_id);
-                        let button = ui.add_enabled(!busy, egui::Button::new("Done"));
-                        if button.clicked() {
-                            actions.push(AccountAction::MarkNotificationDone(thread_id.clone()));
-                        }
-                        if busy {
-                            ui.small("Working…");
+                        if allow_done_action {
+                            let busy = inflight_done.contains(&thread_id);
+                            let button = ui.add_enabled(!busy, egui::Button::new("Done"));
+                            if button.clicked() {
+                                actions
+                                    .push(AccountAction::MarkNotificationDone(thread_id.clone()));
+                            }
+                            if busy {
+                                ui.small("Working…");
+                            }
+                        } else {
+                            ui.label("Done");
                         }
                     });
                 });
             }
         });
     actions
-}
-
-fn draw_review_requests(ui: &mut egui::Ui, items: &[ReviewRequest], filter: &SearchFilter) {
-    let rows: Vec<_> = items
-        .iter()
-        .filter(|item| {
-            filter.matches_any(&[
-                &item.repo,
-                &item.title,
-                &item.url,
-                item.requested_by.as_deref().unwrap_or(""),
-            ])
-        })
-        .collect();
-    if rows.is_empty() {
-        ui.weak(if items.is_empty() {
-            "No pending review requests."
-        } else {
-            "No matches for current search."
-        });
-        return;
-    }
-
-    ui.push_id("review_requests_table", |ui| {
-        TableBuilder::new(ui)
-            .striped(true)
-            .column(Column::initial(120.0).resizable(true))
-            .column(Column::remainder())
-            .column(Column::initial(150.0))
-            .header(20.0, |mut header| {
-                header.col(|ui| {
-                    ui.strong("Repository");
-                });
-                header.col(|ui| {
-                    ui.strong("Pull request");
-                });
-                header.col(|ui| {
-                    ui.strong("Updated");
-                });
-            })
-            .body(|mut body| {
-                for item in rows {
-                    body.row(24.0, |mut row| {
-                        row.col(|ui| {
-                            ui.label(&item.repo);
-                        });
-                        row.col(|ui| {
-                            ui.hyperlink_to(&item.title, &item.url);
-                            if let Some(requester) = &item.requested_by {
-                                ui.small(format!("Requested by {}", requester));
-                            }
-                        });
-                        row.col(|ui| {
-                            ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
-                        });
-                    });
-                }
-            });
-    });
-}
-
-fn draw_mentions(ui: &mut egui::Ui, items: &[MentionThread], filter: &SearchFilter) {
-    let rows: Vec<_> = items
-        .iter()
-        .filter(|item| filter.matches_any(&[&item.repo, &item.title, &item.url]))
-        .collect();
-    if rows.is_empty() {
-        ui.weak(if items.is_empty() {
-            "No recent mentions."
-        } else {
-            "No matches for current search."
-        });
-        return;
-    }
-
-    ui.push_id("mentions_table", |ui| {
-        TableBuilder::new(ui)
-            .striped(true)
-            .column(Column::initial(70.0))
-            .column(Column::initial(140.0).resizable(true))
-            .column(Column::remainder())
-            .column(Column::initial(150.0))
-            .header(20.0, |mut header| {
-                header.col(|ui| {
-                    ui.strong("Type");
-                });
-                header.col(|ui| {
-                    ui.strong("Repository");
-                });
-                header.col(|ui| {
-                    ui.strong("Thread");
-                });
-                header.col(|ui| {
-                    ui.strong("Updated");
-                });
-            })
-            .body(|mut body| {
-                for item in rows {
-                    body.row(24.0, |mut row| {
-                        row.col(|ui| {
-                            ui.label(item.kind.label());
-                        });
-                        row.col(|ui| {
-                            ui.label(&item.repo);
-                        });
-                        row.col(|ui| {
-                            ui.hyperlink_to(&item.title, &item.url);
-                        });
-                        row.col(|ui| {
-                            ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
-                        });
-                    });
-                }
-            });
-    });
-}
-
-fn draw_recent_reviews(ui: &mut egui::Ui, items: &[ReviewSummary], filter: &SearchFilter) {
-    let rows: Vec<_> = items
-        .iter()
-        .filter(|item| filter.matches_any(&[&item.repo, &item.title, &item.url, &item.state]))
-        .collect();
-    if rows.is_empty() {
-        ui.weak(if items.is_empty() {
-            "No recently completed reviews."
-        } else {
-            "No matches for current search."
-        });
-        return;
-    }
-
-    ui.push_id("recent_reviews_table", |ui| {
-        TableBuilder::new(ui)
-            .striped(true)
-            .column(Column::initial(140.0).resizable(true))
-            .column(Column::remainder())
-            .column(Column::initial(90.0))
-            .column(Column::initial(150.0))
-            .header(20.0, |mut header| {
-                header.col(|ui| {
-                    ui.strong("Repository");
-                });
-                header.col(|ui| {
-                    ui.strong("Pull request");
-                });
-                header.col(|ui| {
-                    ui.strong("State");
-                });
-                header.col(|ui| {
-                    ui.strong("Updated");
-                });
-            })
-            .body(|mut body| {
-                for item in rows {
-                    body.row(24.0, |mut row| {
-                        row.col(|ui| {
-                            ui.label(&item.repo);
-                        });
-                        row.col(|ui| {
-                            ui.hyperlink_to(&item.title, &item.url);
-                        });
-                        row.col(|ui| {
-                            ui.label(item.state.as_str());
-                        });
-                        row.col(|ui| {
-                            ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
-                        });
-                    });
-                }
-            });
-    });
 }
 
 // -----------------------------------------------------------------------------
