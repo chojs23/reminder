@@ -1,4 +1,5 @@
 use std::{
+    fs,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
@@ -19,9 +20,33 @@ use crate::{
     storage::AccountStore,
 };
 
-pub const APP_NAME: &str = "GitHub Review Hub";
-const KOREAN_FONT_NAME: &str = "noto_sans_kr";
-const KOREAN_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansKR-Regular.ttf");
+pub const APP_NAME: &str = "Reminder";
+
+pub const CJK_FONT_NAME: &str = "CJK_Fallback_Font";
+
+#[cfg(target_os = "macos")]
+const SYSTEM_FONT_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/Supplemental/AppleSDGothicNeo.ttc",
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/System/Library/Fonts/Supplemental/NotoSansCJK-Regular.ttc",
+];
+
+#[cfg(target_os = "windows")]
+const SYSTEM_FONT_CANDIDATES: &[&str] = &[
+    "C:\\Windows\\Fonts\\malgun.ttf",
+    "C:\\Windows\\Fonts\\malgunbd.ttf",
+    "C:\\Windows\\Fonts\\YuGothM.ttc",
+];
+
+#[cfg(target_os = "linux")]
+const SYSTEM_FONT_CANDIDATES: &[&str] = &[
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.otf",
+];
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+const SYSTEM_FONT_CANDIDATES: &[&str] = &[];
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 180;
 
 pub struct ReminderApp {
@@ -256,17 +281,21 @@ impl ReminderApp {
                         if account.expanded {
                             if let Some(inbox) = &account.inbox {
                                 group.separator();
-                                group.label("Unanswered review requests");
-                                draw_review_requests(group, &inbox.review_requests);
+                                group.collapsing("Unanswered review requests", |section| {
+                                    draw_review_requests(section, &inbox.review_requests);
+                                });
                                 group.separator();
-                                group.label("Mentions");
-                                draw_mentions(group, &inbox.mentions);
+                                group.collapsing("Mentions", |section| {
+                                    draw_mentions(section, &inbox.mentions);
+                                });
                                 group.separator();
-                                group.label("Recently reviewed pull requests");
-                                draw_recent_reviews(group, &inbox.recent_reviews);
+                                group.collapsing("Recently reviewed pull requests", |section| {
+                                    draw_recent_reviews(section, &inbox.recent_reviews);
+                                });
                                 group.separator();
-                                group.label("Notifications");
-                                draw_notifications(group, &inbox.notifications);
+                                group.collapsing("Notifications", |section| {
+                                    draw_notifications(section, &inbox.notifications);
+                                });
                             }
                         } else if account.inbox.is_none() {
                             group.separator();
@@ -285,24 +314,41 @@ impl ReminderApp {
 // -----------------------------------------------------------------------------
 
 fn install_international_fonts(ctx: &Context) {
-    // Korean reviewers reported tofu glyphs because egui's built-in Latin fonts
-    // do not cover Hangul. Ship a bundled Noto Sans KR face and put it at the
-    // front of each family so every widget can render those glyphs.
+    // CJK reviewers reported tofu glyphs because egui's built-in Latin fonts
+    // do not cover Hangul. Prefer system-provided CJK families to avoid bloating
+    // the binary, but fall back to the bundled font when the optional
+    let Some(font_data) = resolve_cjk_font_data() else {
+        eprintln!("Warning: no CJK-capable font found; Some glyphs may fail to render.");
+        return;
+    };
+
     let mut definitions = FontDefinitions::default();
-    definitions.font_data.insert(
-        KOREAN_FONT_NAME.to_owned(),
-        FontData::from_static(KOREAN_FONT_BYTES).into(),
-    );
+    definitions
+        .font_data
+        .insert(CJK_FONT_NAME.to_owned(), font_data.into());
 
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
         definitions
             .families
             .entry(family)
             .or_default()
-            .insert(0, KOREAN_FONT_NAME.to_owned());
+            .insert(0, CJK_FONT_NAME.to_owned());
     }
 
     ctx.set_fonts(definitions);
+}
+
+fn resolve_cjk_font_data() -> Option<FontData> {
+    load_system_cjk_font()
+}
+
+fn load_system_cjk_font() -> Option<FontData> {
+    for candidate in SYSTEM_FONT_CANDIDATES {
+        if let Ok(bytes) = fs::read(candidate) {
+            return Some(FontData::from_owned(bytes));
+        }
+    }
+    None
 }
 
 impl App for ReminderApp {
