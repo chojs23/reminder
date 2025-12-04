@@ -7,7 +7,7 @@ use std::{
 use chrono::Utc;
 use eframe::{
     App, CreationContext, Frame,
-    egui::{self, Context},
+    egui::{self, Context, FontData, FontDefinitions, FontFamily},
 };
 use egui_extras::{Column, TableBuilder};
 
@@ -20,6 +20,8 @@ use crate::{
 };
 
 pub const APP_NAME: &str = "GitHub Review Hub";
+const KOREAN_FONT_NAME: &str = "noto_sans_kr";
+const KOREAN_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansKR-Regular.otf");
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 180;
 
 pub struct ReminderApp {
@@ -32,7 +34,9 @@ pub struct ReminderApp {
 }
 
 impl ReminderApp {
-    pub fn new(_cc: &CreationContext<'_>) -> Self {
+    pub fn new(cc: &CreationContext<'_>) -> Self {
+        install_international_fonts(&cc.egui_ctx);
+
         let mut app = Self {
             account_form: AccountForm::default(),
             accounts: Vec::new(),
@@ -276,6 +280,31 @@ impl ReminderApp {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Font configuration
+// -----------------------------------------------------------------------------
+
+fn install_international_fonts(ctx: &Context) {
+    // Korean reviewers reported tofu glyphs because egui's built-in Latin fonts
+    // do not cover Hangul. Ship a bundled Noto Sans KR face and put it at the
+    // front of each family so every widget can render those glyphs.
+    let mut definitions = FontDefinitions::default();
+    definitions.font_data.insert(
+        KOREAN_FONT_NAME.to_owned(),
+        FontData::from_static(KOREAN_FONT_BYTES).into(),
+    );
+
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        definitions
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, KOREAN_FONT_NAME.to_owned());
+    }
+
+    ctx.set_fonts(definitions);
+}
+
 impl App for ReminderApp {
     fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
         self.poll_jobs();
@@ -430,40 +459,42 @@ fn draw_review_requests(ui: &mut egui::Ui, items: &[ReviewRequest]) {
         return;
     }
 
-    TableBuilder::new(ui)
-        .striped(true)
-        .column(Column::initial(120.0).resizable(true))
-        .column(Column::remainder())
-        .column(Column::initial(150.0))
-        .header(20.0, |mut header| {
-            header.col(|ui| {
-                ui.strong("Repository");
-            });
-            header.col(|ui| {
-                ui.strong("Pull request");
-            });
-            header.col(|ui| {
-                ui.strong("Updated");
-            });
-        })
-        .body(|mut body| {
-            for item in items {
-                body.row(24.0, |mut row| {
-                    row.col(|ui| {
-                        ui.label(&item.repo);
-                    });
-                    row.col(|ui| {
-                        ui.hyperlink_to(&item.title, &item.url);
-                        if let Some(requester) = &item.requested_by {
-                            ui.small(format!("Requested by {}", requester));
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
-                    });
+    ui.push_id("review_requests_table", |ui| {
+        TableBuilder::new(ui)
+            .striped(true)
+            .column(Column::initial(120.0).resizable(true))
+            .column(Column::remainder())
+            .column(Column::initial(150.0))
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Repository");
                 });
-            }
-        });
+                header.col(|ui| {
+                    ui.strong("Pull request");
+                });
+                header.col(|ui| {
+                    ui.strong("Updated");
+                });
+            })
+            .body(|mut body| {
+                for item in items {
+                    body.row(24.0, |mut row| {
+                        row.col(|ui| {
+                            ui.label(&item.repo);
+                        });
+                        row.col(|ui| {
+                            ui.hyperlink_to(&item.title, &item.url);
+                            if let Some(requester) = &item.requested_by {
+                                ui.small(format!("Requested by {}", requester));
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
+                        });
+                    });
+                }
+            });
+    });
 }
 
 fn draw_mentions(ui: &mut egui::Ui, items: &[MentionThread]) {
@@ -472,44 +503,46 @@ fn draw_mentions(ui: &mut egui::Ui, items: &[MentionThread]) {
         return;
     }
 
-    TableBuilder::new(ui)
-        .striped(true)
-        .column(Column::initial(70.0))
-        .column(Column::initial(140.0).resizable(true))
-        .column(Column::remainder())
-        .column(Column::initial(150.0))
-        .header(20.0, |mut header| {
-            header.col(|ui| {
-                ui.strong("Type");
-            });
-            header.col(|ui| {
-                ui.strong("Repository");
-            });
-            header.col(|ui| {
-                ui.strong("Thread");
-            });
-            header.col(|ui| {
-                ui.strong("Updated");
-            });
-        })
-        .body(|mut body| {
-            for item in items {
-                body.row(24.0, |mut row| {
-                    row.col(|ui| {
-                        ui.label(item.kind.label());
-                    });
-                    row.col(|ui| {
-                        ui.label(&item.repo);
-                    });
-                    row.col(|ui| {
-                        ui.hyperlink_to(&item.title, &item.url);
-                    });
-                    row.col(|ui| {
-                        ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
-                    });
+    ui.push_id("mentions_table", |ui| {
+        TableBuilder::new(ui)
+            .striped(true)
+            .column(Column::initial(70.0))
+            .column(Column::initial(140.0).resizable(true))
+            .column(Column::remainder())
+            .column(Column::initial(150.0))
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Type");
                 });
-            }
-        });
+                header.col(|ui| {
+                    ui.strong("Repository");
+                });
+                header.col(|ui| {
+                    ui.strong("Thread");
+                });
+                header.col(|ui| {
+                    ui.strong("Updated");
+                });
+            })
+            .body(|mut body| {
+                for item in items {
+                    body.row(24.0, |mut row| {
+                        row.col(|ui| {
+                            ui.label(item.kind.label());
+                        });
+                        row.col(|ui| {
+                            ui.label(&item.repo);
+                        });
+                        row.col(|ui| {
+                            ui.hyperlink_to(&item.title, &item.url);
+                        });
+                        row.col(|ui| {
+                            ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
+                        });
+                    });
+                }
+            });
+    });
 }
 
 fn draw_recent_reviews(ui: &mut egui::Ui, items: &[ReviewSummary]) {
@@ -518,44 +551,46 @@ fn draw_recent_reviews(ui: &mut egui::Ui, items: &[ReviewSummary]) {
         return;
     }
 
-    TableBuilder::new(ui)
-        .striped(true)
-        .column(Column::initial(140.0).resizable(true))
-        .column(Column::remainder())
-        .column(Column::initial(90.0))
-        .column(Column::initial(150.0))
-        .header(20.0, |mut header| {
-            header.col(|ui| {
-                ui.strong("Repository");
-            });
-            header.col(|ui| {
-                ui.strong("Pull request");
-            });
-            header.col(|ui| {
-                ui.strong("State");
-            });
-            header.col(|ui| {
-                ui.strong("Updated");
-            });
-        })
-        .body(|mut body| {
-            for item in items {
-                body.row(24.0, |mut row| {
-                    row.col(|ui| {
-                        ui.label(&item.repo);
-                    });
-                    row.col(|ui| {
-                        ui.hyperlink_to(&item.title, &item.url);
-                    });
-                    row.col(|ui| {
-                        ui.label(item.state.as_str());
-                    });
-                    row.col(|ui| {
-                        ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
-                    });
+    ui.push_id("recent_reviews_table", |ui| {
+        TableBuilder::new(ui)
+            .striped(true)
+            .column(Column::initial(140.0).resizable(true))
+            .column(Column::remainder())
+            .column(Column::initial(90.0))
+            .column(Column::initial(150.0))
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Repository");
                 });
-            }
-        });
+                header.col(|ui| {
+                    ui.strong("Pull request");
+                });
+                header.col(|ui| {
+                    ui.strong("State");
+                });
+                header.col(|ui| {
+                    ui.strong("Updated");
+                });
+            })
+            .body(|mut body| {
+                for item in items {
+                    body.row(24.0, |mut row| {
+                        row.col(|ui| {
+                            ui.label(&item.repo);
+                        });
+                        row.col(|ui| {
+                            ui.hyperlink_to(&item.title, &item.url);
+                        });
+                        row.col(|ui| {
+                            ui.label(item.state.as_str());
+                        });
+                        row.col(|ui| {
+                            ui.label(item.updated_at.format("%Y-%m-%d %H:%M").to_string());
+                        });
+                    });
+                }
+            });
+    });
 }
 
 // -----------------------------------------------------------------------------
