@@ -8,7 +8,7 @@ use std::{
 use chrono::Utc;
 use eframe::{
     App, CreationContext, Frame,
-    egui::{self, Context, FontData, FontDefinitions, FontFamily},
+    egui::{self, Context, FontData, FontDefinitions, FontFamily, Layout},
 };
 use egui_extras::{Column, TableBuilder};
 
@@ -141,11 +141,10 @@ impl ReminderApp {
         }
 
         let login = self.accounts[idx].profile.login.clone();
-        if let Some(store) = &self.secret_store {
-            if let Err(err) = store.forget(&login) {
-                self.global_error =
-                    Some(format!("Failed to remove credentials for {login}: {err}"));
-            }
+        if let Some(store) = &self.secret_store
+            && let Err(err) = store.forget(&login)
+        {
+            self.global_error = Some(format!("Failed to remove credentials for {login}: {err}"));
         }
 
         self.accounts.remove(idx);
@@ -236,10 +235,7 @@ impl ReminderApp {
     }
 
     fn render_dashboard(&mut self, ui: &mut egui::Ui) {
-        if let Some(error) = &self.global_error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-            ui.add_space(8.0);
-        }
+        self.render_global_error(ui);
 
         if self.accounts.is_empty() {
             ui.centered_and_justified(|center| {
@@ -250,63 +246,103 @@ impl ReminderApp {
 
         egui::ScrollArea::vertical().show(ui, |area| {
             for account in &mut self.accounts {
-                area.push_id(&account.profile.login, |ui| {
-                    ui.group(|group| {
-                        group.horizontal(|row| {
-                            row.heading(format!("Account: {}", account.profile.login));
-                            let toggle_label = if account.expanded {
-                                "Hide notifications"
-                            } else {
-                                "Show notifications"
-                            };
-                            if row.small_button(toggle_label).clicked() {
-                                account.expanded = !account.expanded;
-                            }
-                        });
-                        if let Some(inbox) = &account.inbox {
-                            group.label(format!(
-                                "Last synced {} UTC",
-                                inbox.fetched_at.format("%Y-%m-%d %H:%M:%S")
-                            ));
-                        } else {
-                            group.label("No data fetched yet.");
-                        }
-
-                        if let Some(err) = &account.last_error {
-                            group.colored_label(group.visuals().error_fg_color, err);
-                        } else if account.pending_job.is_some() {
-                            group.label("Fetching latest notifications...");
-                        }
-
-                        if account.expanded {
-                            if let Some(inbox) = &account.inbox {
-                                group.separator();
-                                group.collapsing("Unanswered review requests", |section| {
-                                    draw_review_requests(section, &inbox.review_requests);
-                                });
-                                group.separator();
-                                group.collapsing("Mentions", |section| {
-                                    draw_mentions(section, &inbox.mentions);
-                                });
-                                group.separator();
-                                group.collapsing("Recently reviewed pull requests", |section| {
-                                    draw_recent_reviews(section, &inbox.recent_reviews);
-                                });
-                                group.separator();
-                                group.collapsing("Notifications", |section| {
-                                    draw_notifications(section, &inbox.notifications);
-                                });
-                            }
-                        } else if account.inbox.is_none() {
-                            group.separator();
-                            group.weak("No data loaded yet.");
-                        }
-                    });
-                    ui.add_space(12.0);
+                let account_id = account.profile.login.clone();
+                area.push_id(account_id, |ui| {
+                    render_account_card(ui, account);
                 });
             }
         });
     }
+
+    fn render_global_error(&self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.global_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+            ui.add_space(8.0);
+        }
+    }
+}
+
+fn render_account_card(ui: &mut egui::Ui, account: &mut AccountState) {
+    ui.group(|group| {
+        render_account_header(group, account);
+        render_account_status(group, account);
+        render_account_body(group, account);
+    });
+    ui.add_space(12.0);
+}
+
+fn render_account_header(group: &mut egui::Ui, account: &mut AccountState) {
+    group.horizontal(|row| {
+        row.heading(format!("Account: {}", account.profile.login));
+        if row
+            .small_button(if account.expanded {
+                "Hide notifications"
+            } else {
+                "Show notifications"
+            })
+            .clicked()
+        {
+            account.expanded = !account.expanded;
+        }
+        row.with_layout(Layout::right_to_left(egui::Align::Center), |lane| {
+            lane.add(
+                egui::TextEdit::singleline(&mut account.search_query)
+                    .hint_text("Search…")
+                    .desired_width(160.0),
+            );
+        });
+    });
+}
+
+fn render_account_status(group: &mut egui::Ui, account: &AccountState) {
+    if let Some(inbox) = &account.inbox {
+        group.label(format!(
+            "Last synced {} UTC",
+            inbox.fetched_at.format("%Y-%m-%d %H:%M:%S")
+        ));
+    } else {
+        group.label("No data fetched yet.");
+    }
+
+    if let Some(err) = &account.last_error {
+        group.colored_label(group.visuals().error_fg_color, err);
+    } else if account.pending_job.is_some() {
+        group.label("Fetching latest notifications...");
+    }
+}
+
+fn render_account_body(group: &mut egui::Ui, account: &AccountState) {
+    if !account.expanded {
+        if account.inbox.is_none() {
+            group.separator();
+            group.weak("No data loaded yet.");
+        }
+        return;
+    }
+
+    if let Some(inbox) = &account.inbox {
+        group.separator();
+        let filter = SearchFilter::new(&account.search_query);
+        render_account_sections(group, inbox, &filter);
+    }
+}
+
+fn render_account_sections(group: &mut egui::Ui, inbox: &InboxSnapshot, filter: &SearchFilter) {
+    group.collapsing("Unanswered review requests", |section| {
+        draw_review_requests(section, &inbox.review_requests, filter);
+    });
+    group.separator();
+    group.collapsing("Mentions", |section| {
+        draw_mentions(section, &inbox.mentions, filter);
+    });
+    group.separator();
+    group.collapsing("Recently reviewed pull requests", |section| {
+        draw_recent_reviews(section, &inbox.recent_reviews, filter);
+    });
+    group.separator();
+    group.collapsing("Notifications", |section| {
+        draw_notifications(section, &inbox.notifications, filter);
+    });
 }
 
 // -----------------------------------------------------------------------------
@@ -378,6 +414,7 @@ struct AccountState {
     last_error: Option<String>,
     pending_job: Option<PendingJob>,
     expanded: bool,
+    search_query: String,
 }
 
 impl AccountState {
@@ -388,6 +425,7 @@ impl AccountState {
             last_error: None,
             pending_job: None,
             expanded: true,
+            search_query: String::new(),
         }
     }
 
@@ -455,9 +493,17 @@ impl PendingJob {
 // UI helpers
 // -----------------------------------------------------------------------------
 
-fn draw_notifications(ui: &mut egui::Ui, items: &[NotificationItem]) {
-    if items.is_empty() {
-        ui.weak("You're all caught up 🎉");
+fn draw_notifications(ui: &mut egui::Ui, items: &[NotificationItem], filter: &SearchFilter) {
+    let rows: Vec<_> = items
+        .iter()
+        .filter(|item| filter.matches_any(&[&item.repo, &item.title, &item.reason]))
+        .collect();
+    if rows.is_empty() {
+        ui.weak(if items.is_empty() {
+            "You're all caught up 🎉"
+        } else {
+            "No matches for current search."
+        });
         return;
     }
 
@@ -478,7 +524,7 @@ fn draw_notifications(ui: &mut egui::Ui, items: &[NotificationItem]) {
             });
         })
         .body(|mut body| {
-            for item in items {
+            for item in rows {
                 body.row(24.0, |mut row| {
                     row.col(|ui| {
                         ui.label(&item.repo);
@@ -499,9 +545,24 @@ fn draw_notifications(ui: &mut egui::Ui, items: &[NotificationItem]) {
         });
 }
 
-fn draw_review_requests(ui: &mut egui::Ui, items: &[ReviewRequest]) {
-    if items.is_empty() {
-        ui.weak("No pending review requests.");
+fn draw_review_requests(ui: &mut egui::Ui, items: &[ReviewRequest], filter: &SearchFilter) {
+    let rows: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            filter.matches_any(&[
+                &item.repo,
+                &item.title,
+                &item.url,
+                item.requested_by.as_deref().unwrap_or(""),
+            ])
+        })
+        .collect();
+    if rows.is_empty() {
+        ui.weak(if items.is_empty() {
+            "No pending review requests."
+        } else {
+            "No matches for current search."
+        });
         return;
     }
 
@@ -523,7 +584,7 @@ fn draw_review_requests(ui: &mut egui::Ui, items: &[ReviewRequest]) {
                 });
             })
             .body(|mut body| {
-                for item in items {
+                for item in rows {
                     body.row(24.0, |mut row| {
                         row.col(|ui| {
                             ui.label(&item.repo);
@@ -543,9 +604,17 @@ fn draw_review_requests(ui: &mut egui::Ui, items: &[ReviewRequest]) {
     });
 }
 
-fn draw_mentions(ui: &mut egui::Ui, items: &[MentionThread]) {
-    if items.is_empty() {
-        ui.weak("No recent mentions.");
+fn draw_mentions(ui: &mut egui::Ui, items: &[MentionThread], filter: &SearchFilter) {
+    let rows: Vec<_> = items
+        .iter()
+        .filter(|item| filter.matches_any(&[&item.repo, &item.title, &item.url]))
+        .collect();
+    if rows.is_empty() {
+        ui.weak(if items.is_empty() {
+            "No recent mentions."
+        } else {
+            "No matches for current search."
+        });
         return;
     }
 
@@ -571,7 +640,7 @@ fn draw_mentions(ui: &mut egui::Ui, items: &[MentionThread]) {
                 });
             })
             .body(|mut body| {
-                for item in items {
+                for item in rows {
                     body.row(24.0, |mut row| {
                         row.col(|ui| {
                             ui.label(item.kind.label());
@@ -591,9 +660,17 @@ fn draw_mentions(ui: &mut egui::Ui, items: &[MentionThread]) {
     });
 }
 
-fn draw_recent_reviews(ui: &mut egui::Ui, items: &[ReviewSummary]) {
-    if items.is_empty() {
-        ui.weak("No recently completed reviews.");
+fn draw_recent_reviews(ui: &mut egui::Ui, items: &[ReviewSummary], filter: &SearchFilter) {
+    let rows: Vec<_> = items
+        .iter()
+        .filter(|item| filter.matches_any(&[&item.repo, &item.title, &item.url, &item.state]))
+        .collect();
+    if rows.is_empty() {
+        ui.weak(if items.is_empty() {
+            "No recently completed reviews."
+        } else {
+            "No matches for current search."
+        });
         return;
     }
 
@@ -619,7 +696,7 @@ fn draw_recent_reviews(ui: &mut egui::Ui, items: &[ReviewSummary]) {
                 });
             })
             .body(|mut body| {
-                for item in items {
+                for item in rows {
                     body.row(24.0, |mut row| {
                         row.col(|ui| {
                             ui.label(&item.repo);
@@ -672,5 +749,34 @@ impl BatchRefreshScheduler {
 
     fn mark_triggered(&mut self) {
         self.last_run = Some(Instant::now());
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Search filtering
+// -----------------------------------------------------------------------------
+
+struct SearchFilter {
+    needle: Option<String>,
+}
+
+impl SearchFilter {
+    fn new(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        let needle = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_lowercase())
+        };
+        Self { needle }
+    }
+
+    fn matches_any(&self, fields: &[&str]) -> bool {
+        match &self.needle {
+            None => true,
+            Some(needle) => fields
+                .iter()
+                .any(|field| field.to_lowercase().contains(needle)),
+        }
     }
 }
