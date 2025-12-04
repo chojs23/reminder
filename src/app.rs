@@ -21,7 +21,7 @@ use crate::{
 
 pub const APP_NAME: &str = "GitHub Review Hub";
 const KOREAN_FONT_NAME: &str = "noto_sans_kr";
-const KOREAN_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansKR-Regular.otf");
+const KOREAN_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansKR-Regular.ttf");
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 180;
 
 pub struct ReminderApp {
