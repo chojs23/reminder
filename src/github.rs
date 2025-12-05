@@ -47,6 +47,10 @@ pub fn mark_notification_done(
     profile: &GitHubAccount,
     thread_id: &str,
 ) -> Result<(), FetchError> {
+    // This endpoint remains for future use, but UI-triggered "Done" actions are
+    // currently disabled because GitHub's notifications feed cannot be filtered
+    // to exclude already-archived items. Removing the call entirely would make
+    // re-enabling the workflow harder if GitHub adds proper server-side filtering.
     if profile.token.is_empty() {
         return Err(FetchError::MissingToken);
     }

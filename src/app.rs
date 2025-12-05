@@ -345,14 +345,13 @@ fn render_account_sections(
     const REVIEW_REQUEST_REASON: &str = "review_requested";
     const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
 
-    // Keep "seen" notifications in their contextual buckets so reviewers can finish
-    // sweeping the list, and reserve the Done section for entries GitHub considers
-    // read (either via this app or elsewhere).
+    // Show both seen and unseen items in their contextual buckets; the Done section
+    // is temporarily disabled to avoid splitting the feed.
     let mut actions = Vec::new();
     let review_requests: Vec<_> = inbox
         .notifications
         .iter()
-        .filter(|item| item.reason == REVIEW_REQUEST_REASON && item.unread)
+        .filter(|item| item.reason == REVIEW_REQUEST_REASON)
         .collect();
 
     actions.extend(render_notification_section(
@@ -369,7 +368,7 @@ fn render_account_sections(
     let mentions: Vec<_> = inbox
         .notifications
         .iter()
-        .filter(|item| MENTION_REASONS.contains(&item.reason.as_str()) && item.unread)
+        .filter(|item| MENTION_REASONS.contains(&item.reason.as_str()))
         .collect();
     actions.extend(render_notification_section(
         group,
@@ -382,39 +381,21 @@ fn render_account_sections(
     ));
     group.separator();
 
-    let other_unread: Vec<_> = inbox
+    let other: Vec<_> = inbox
         .notifications
         .iter()
         .filter(|item| {
-            item.reason != REVIEW_REQUEST_REASON
-                && !MENTION_REASONS.contains(&item.reason.as_str())
-                && item.unread
+            item.reason != REVIEW_REQUEST_REASON && !MENTION_REASONS.contains(&item.reason.as_str())
         })
         .collect();
     actions.extend(render_notification_section(
         group,
         "Notifications",
-        other_unread,
+        other,
         "You're all caught up 🎉",
         filter,
         inflight_done,
         true,
-    ));
-    group.separator();
-
-    let done_items: Vec<_> = inbox
-        .notifications
-        .iter()
-        .filter(|item| !item.unread)
-        .collect();
-    actions.extend(render_notification_section(
-        group,
-        "Done notifications",
-        done_items,
-        "Nothing marked done yet.",
-        filter,
-        inflight_done,
-        false,
     ));
 
     actions
@@ -700,7 +681,7 @@ fn draw_notifications(
     inflight_done: &HashSet<String>,
     allow_done_action: bool,
 ) -> Vec<AccountAction> {
-    let mut actions = Vec::new();
+    let actions = Vec::new();
     let rows: Vec<_> = items
         .iter()
         .copied()
@@ -733,7 +714,7 @@ fn draw_notifications(
         })
         .body(|mut body| {
             for item in rows {
-                let thread_id = item.thread_id.clone();
+                let _thread_id = &item.thread_id;
                 let seen = !item.unread;
                 body.row(24.0, |mut row| {
                     row.col(|ui| {
@@ -760,19 +741,11 @@ fn draw_notifications(
                         ));
                     });
                     row.col(|ui| {
-                        if allow_done_action {
-                            let busy = inflight_done.contains(&thread_id);
-                            let button = ui.add_enabled(!busy, egui::Button::new("Done"));
-                            if button.clicked() {
-                                actions
-                                    .push(AccountAction::MarkNotificationDone(thread_id.clone()));
-                            }
-                            if busy {
-                                ui.small("Working…");
-                            }
-                        } else {
-                            ui.label("Done");
-                        }
+                        // Done actions are disabled because GitHub's notifications API
+                        // does not expose a dedicated "done" filter. Keep the column as
+                        // a placeholder to preserve layout, but skip the button.
+                        let _ = (allow_done_action, inflight_done);
+                        ui.weak("—");
                     });
                 });
             }
@@ -784,6 +757,7 @@ fn draw_notifications(
 // Supporting structs
 // -----------------------------------------------------------------------------
 
+#[allow(dead_code)]
 enum AccountAction {
     MarkNotificationDone(String),
 }
