@@ -2,6 +2,9 @@
 
 Multi-account GitHub triage desktop app built with eframe/egui. It surfaces review requests, mentions, recent reviews, and notifications for several identities so you can sweep queues quickly without hopping profiles.
 
+<img width="500" height="300" alt="preview" src="https://github.com/user-attachments/assets/820231fc-b025-47c9-91fe-a38928092b95" />
+
+
 ## Features
 - Track multiple GitHub accounts; each gets its own dashboard card with manual and auto-refresh (every ~180s) so long-running network work stays off the UI thread.
 - Notification buckets: review requests, mentions, recent reviews, and everything else. Section headers display live counts for `unseen` and `updated` items within the bucket, matching the current filter.
