@@ -28,6 +28,7 @@ pub struct NotificationItem {
     pub url: Option<String>,
     pub reason: String,
     pub updated_at: DateTime<Utc>,
+    pub last_read_at: Option<DateTime<Utc>>,
     pub unread: bool,
 }
 

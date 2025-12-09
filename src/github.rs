@@ -96,6 +96,7 @@ fn fetch_notifications(
             }),
             reason: item.reason,
             updated_at: item.updated_at,
+            last_read_at: item.last_read_at,
             unread: item.unread,
         })
         .collect())
@@ -232,6 +233,7 @@ struct NotificationResponse {
     id: String,
     reason: String,
     updated_at: DateTime<Utc>,
+    last_read_at: Option<DateTime<Utc>>,
     unread: bool,
     subject: NotificationSubject,
     repository: NotificationRepository,

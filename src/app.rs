@@ -644,15 +644,21 @@ fn render_notification_section<'a>(
     inflight_done: &HashSet<String>,
     allow_done_action: bool,
 ) -> Vec<AccountAction> {
+    let (unseen_count, updated_count) = summarize_counts(&subset);
+    let heading = format!(
+        "{title} ({} unseen, {} updated)",
+        unseen_count, updated_count
+    );
+
     if subset.is_empty() {
-        group.collapsing(title, |section| {
+        group.collapsing(heading, |section| {
             section.weak(empty_label);
         });
         return Vec::new();
     }
 
     let mut actions = Vec::new();
-    group.collapsing(title, |section| {
+    group.collapsing(heading, |section| {
         actions.extend(draw_notifications(
             section,
             &subset,
@@ -664,11 +670,54 @@ fn render_notification_section<'a>(
     actions
 }
 
-// Seen-but-not-done notifications stay visible but get a softer palette so they do
-// not compete with fresh unread rows.
-fn notification_text(ui: &egui::Ui, text: impl Into<String>, seen: bool) -> RichText {
+fn summarize_counts(items: &[&NotificationItem]) -> (usize, usize) {
+    let mut unseen = 0;
+    let mut updated = 0;
+    for item in items {
+        let visual = notification_state(item);
+        if item.unread {
+            unseen += 1;
+        }
+        if visual.needs_revisit {
+            updated += 1;
+        }
+    }
+    (unseen, updated)
+}
+
+// Highlight notifications that churned after the last time we read the thread so
+// they do not silently blend into the "seen" palette. GitHub surfaces
+// `last_read_at` alongside `unread`, but clients may set `unread` to false while a
+// thread continues to evolve.
+#[derive(Clone, Copy)]
+struct NotificationVisualState {
+    seen: bool,
+    needs_revisit: bool,
+}
+
+fn notification_state(item: &NotificationItem) -> NotificationVisualState {
+    let needs_revisit = item
+        .last_read_at
+        .map(|last_read| item.updated_at > last_read)
+        .unwrap_or(false);
+
+    NotificationVisualState {
+        // A thread counts as "seen" only if GitHub marks it read and no updates
+        // landed after that read timestamp.
+        seen: !item.unread && !needs_revisit,
+        needs_revisit,
+    }
+}
+
+fn notification_text(
+    ui: &egui::Ui,
+    text: impl Into<String>,
+    visual: NotificationVisualState,
+) -> RichText {
     let mut content = RichText::new(text.into());
-    if seen {
+    if visual.needs_revisit {
+        content = content.color(ui.visuals().warn_fg_color);
+    } else if visual.seen {
         content = content.color(ui.visuals().weak_text_color());
     }
     content
@@ -715,29 +764,38 @@ fn draw_notifications(
         .body(|mut body| {
             for item in rows {
                 let _thread_id = &item.thread_id;
-                let seen = !item.unread;
+                let visual = notification_state(item);
                 body.row(24.0, |mut row| {
                     row.col(|ui| {
-                        ui.label(notification_text(ui, &item.repo, seen));
+                        ui.label(notification_text(ui, &item.repo, visual));
                     });
                     row.col(|ui| {
-                        let subject = notification_text(ui, &item.title, seen);
-                        if let Some(url) = &item.url {
-                            ui.hyperlink_to(subject, url);
-                        } else {
-                            ui.label(subject);
-                        }
+                        ui.horizontal(|row_ui| {
+                            let subject = notification_text(row_ui, &item.title, visual);
+                            if let Some(url) = &item.url {
+                                row_ui.hyperlink_to(subject, url);
+                            } else {
+                                row_ui.label(subject);
+                            }
+                            if visual.needs_revisit {
+                                row_ui.small(
+                                    RichText::new("Updated")
+                                        .strong()
+                                        .color(row_ui.visuals().warn_fg_color),
+                                );
+                            }
+                        });
                         ui.small(notification_text(
                             ui,
                             format!("Reason: {}", &item.reason),
-                            seen,
+                            visual,
                         ));
                     });
                     row.col(|ui| {
                         ui.label(notification_text(
                             ui,
                             item.updated_at.format("%Y-%m-%d %H:%M").to_string(),
-                            seen,
+                            visual,
                         ));
                     });
                     row.col(|ui| {
