@@ -794,93 +794,101 @@ fn draw_notifications(
         return actions;
     }
 
-    TableBuilder::new(ui)
-        .striped(true)
-        .column(Column::initial(120.0).resizable(true))
-        .column(Column::remainder())
-        .column(Column::initial(150.0))
-        .column(Column::initial(90.0))
-        .header(20.0, |mut header| {
-            header.col(|ui| {
-                ui.strong("Repository");
-            });
-            header.col(|ui| {
-                ui.strong("Subject");
-            });
-            header.col(|ui| {
-                ui.strong("Updated");
-            });
-            header.col(|ui| {
-                ui.strong("Actions");
-            });
-        })
-        .body(|mut body| {
-            for item in rows {
-                let _thread_id = &item.thread_id;
-                let visual = notification_state(item);
-                body.row(24.0, |mut row| {
-                    row.col(|ui| {
-                        ui.label(notification_text(ui, &item.repo, visual));
+    egui::ScrollArea::horizontal()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .column(Column::initial(140.0).resizable(true))
+                .column(Column::remainder().at_least(180.0))
+                .column(Column::initial(170.0).resizable(true))
+                .column(Column::initial(110.0))
+                .header(20.0, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("Repository");
                     });
-                    row.col(|ui| {
-                        ui.horizontal(|row_ui| {
-                            let subject = notification_text(row_ui, &item.title, visual);
-                            if let Some(url) = &item.url {
-                                let resp = row_ui.hyperlink_to(subject, url);
-                                if resp.clicked() {
-                                    actions.push(AccountAction::MarkNotificationSeen(
+                    header.col(|ui| {
+                        ui.strong("Subject");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Updated");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Actions");
+                    });
+                })
+                .body(|mut body| {
+                    for item in rows {
+                        let _thread_id = &item.thread_id;
+                        let visual = notification_state(item);
+                        body.row(24.0, |mut row| {
+                            row.col(|ui| {
+                                ui.label(notification_text(ui, &item.repo, visual));
+                            });
+                            row.col(|ui| {
+                                ui.horizontal(|row_ui| {
+                                    let subject = notification_text(row_ui, &item.title, visual);
+                                    if let Some(url) = &item.url {
+                                        let resp = row_ui.hyperlink_to(subject, url);
+                                        if resp.clicked() {
+                                            actions.push(AccountAction::MarkNotificationSeen(
+                                                item.thread_id.clone(),
+                                            ));
+                                        }
+                                    } else {
+                                        let resp = row_ui.label(subject);
+                                        if resp.clicked() {
+                                            actions.push(AccountAction::MarkNotificationSeen(
+                                                item.thread_id.clone(),
+                                            ));
+                                        }
+                                    }
+                                    if visual.needs_revisit {
+                                        row_ui.small(
+                                            RichText::new("Updated")
+                                                .strong()
+                                                .color(row_ui.visuals().warn_fg_color),
+                                        );
+                                    }
+                                });
+                                ui.small(notification_text(
+                                    ui,
+                                    format!("Reason: {}", &item.reason),
+                                    visual,
+                                ));
+                            });
+                            row.col(|ui| {
+                                ui.label(notification_text(
+                                    ui,
+                                    item.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+                                    visual,
+                                ));
+                            });
+                            row.col(|ui| {
+                                let busy = inflight_done.contains(&item.thread_id);
+                                let already_read = !item.unread && !visual.needs_revisit;
+
+                                if ui
+                                    .add_enabled(
+                                        !busy && !already_read,
+                                        egui::Button::new("Mark read"),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(AccountAction::MarkNotificationRead(
                                         item.thread_id.clone(),
                                     ));
                                 }
-                            } else {
-                                let resp = row_ui.label(subject);
-                                if resp.clicked() {
-                                    actions.push(AccountAction::MarkNotificationSeen(
-                                        item.thread_id.clone(),
-                                    ));
+
+                                // Keep layout width consistent even when disabled.
+                                if busy {
+                                    ui.spinner();
                                 }
-                            }
-                            if visual.needs_revisit {
-                                row_ui.small(
-                                    RichText::new("Updated")
-                                        .strong()
-                                        .color(row_ui.visuals().warn_fg_color),
-                                );
-                            }
+                                let _ = allow_done_action;
+                            });
                         });
-                        ui.small(notification_text(
-                            ui,
-                            format!("Reason: {}", &item.reason),
-                            visual,
-                        ));
-                    });
-                    row.col(|ui| {
-                        ui.label(notification_text(
-                            ui,
-                            item.updated_at.format("%Y-%m-%d %H:%M").to_string(),
-                            visual,
-                        ));
-                    });
-                    row.col(|ui| {
-                        let busy = inflight_done.contains(&item.thread_id);
-                        let already_read = !item.unread && !visual.needs_revisit;
-
-                        if ui
-                            .add_enabled(!busy && !already_read, egui::Button::new("Mark read"))
-                            .clicked()
-                        {
-                            actions
-                                .push(AccountAction::MarkNotificationRead(item.thread_id.clone()));
-                        }
-
-                        // Keep layout width consistent even when disabled.
-                        if busy {
-                            ui.spinner();
-                        }
-                        let _ = allow_done_action;
-                    });
+                    }
                 });
-            }
         });
     actions
 }
