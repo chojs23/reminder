@@ -1069,3 +1069,94 @@ impl SearchFilter {
         }
     }
 }
+
+// -------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, NaiveDateTime, Utc};
+
+    fn parse_utc(ts: &str) -> DateTime<Utc> {
+        NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+            .unwrap()
+            .and_utc()
+    }
+
+    fn notif(thread_id: &str, reason: &str, unread: bool, updated: &str) -> NotificationItem {
+        NotificationItem {
+            thread_id: thread_id.to_string(),
+            repo: "acme/repo".into(),
+            title: "Title".into(),
+            url: None,
+            reason: reason.into(),
+            updated_at: parse_utc(updated),
+            last_read_at: None,
+            unread,
+        }
+    }
+
+    fn inbox_with_notifications(notifications: Vec<NotificationItem>) -> InboxSnapshot {
+        InboxSnapshot {
+            notifications,
+            review_requests: Vec::new(),
+            mentions: Vec::new(),
+            recent_reviews: Vec::new(),
+            fetched_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn section_stats_groups_by_reason() {
+        let inbox = inbox_with_notifications(vec![
+            notif("1", "review_requested", true, "2024-01-01 00:00:00"),
+            notif("2", "mention", true, "2024-01-01 00:00:00"),
+            notif("3", "subscribed", false, "2024-01-01 00:00:00"),
+        ]);
+        let stats = section_stats(&inbox);
+        assert_eq!(stats.review_requests.unseen, 1);
+        assert_eq!(stats.mentions.unseen, 1);
+        assert_eq!(stats.notifications.unseen, 0);
+    }
+
+    #[test]
+    fn section_counts_bumped_on_unseen_increase() {
+        let old = SectionCounts::new(1, 0);
+        let new = SectionCounts::new(2, 0);
+        assert!(new.bumped_since(&old));
+    }
+
+    #[test]
+    fn section_counts_not_bumped_when_same() {
+        let old = SectionCounts::new(1, 1);
+        let new = SectionCounts::new(1, 1);
+        assert!(!new.bumped_since(&old));
+    }
+
+    #[test]
+    fn search_filter_matches_case_insensitive() {
+        let filter = SearchFilter::new("Repo");
+        assert!(filter.matches_any(&["my/repo"]));
+        assert!(!filter.matches_any(&["other/project"]));
+    }
+
+    #[test]
+    fn batch_scheduler_triggers_after_interval() {
+        let mut scheduler = BatchRefreshScheduler::new(Duration::from_secs(1));
+        assert!(scheduler.should_trigger());
+        scheduler.mark_triggered();
+        scheduler.last_run = Some(Instant::now() - Duration::from_secs(2));
+        assert!(scheduler.should_trigger());
+    }
+
+    #[test]
+    fn notification_state_detects_revisit() {
+        let mut item = notif("1", "subscribed", false, "2024-01-02 00:00:00");
+        item.last_read_at = Some(parse_utc("2024-01-01 00:00:00"));
+        let visual = notification_state(&item);
+        assert!(visual.needs_revisit);
+        assert!(!visual.seen);
+    }
+}

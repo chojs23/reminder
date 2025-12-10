@@ -270,6 +270,44 @@ struct NotificationRepository {
     full_name: String,
 }
 
+// -------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_thread_distinguishes_pr_and_issue() {
+        assert!(matches!(
+            classify_thread("https://api.github.com/repos/acme/r/pull/1"),
+            MentionKind::PullRequest
+        ));
+        assert!(matches!(
+            classify_thread("https://api.github.com/repos/acme/r/issues/2"),
+            MentionKind::Issue
+        ));
+    }
+
+    #[test]
+    fn extract_repo_name_trims_prefix() {
+        let repo = extract_repo_name("https://api.github.com/repos/acme/widgets");
+        assert_eq!(repo, "acme/widgets");
+    }
+
+    #[test]
+    fn mark_notification_read_requires_token() {
+        let client = build_client().expect("client");
+        let profile = GitHubAccount {
+            login: "user".into(),
+            token: String::new(),
+        };
+        let result = mark_notification_read(&client, &profile, "thread123");
+        assert!(matches!(result, Err(FetchError::MissingToken)));
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
     items: Vec<SearchItem>,
