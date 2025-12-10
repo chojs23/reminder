@@ -66,6 +66,26 @@ pub fn mark_notification_done(
     Ok(())
 }
 
+pub fn mark_notification_read(
+    client: &Client,
+    profile: &GitHubAccount,
+    thread_id: &str,
+) -> Result<(), FetchError> {
+    if profile.token.is_empty() {
+        return Err(FetchError::MissingToken);
+    }
+
+    let url = format!("{GH_NOTIFICATION_THREAD}/{thread_id}");
+    client
+        .patch(url)
+        .header(USER_AGENT, USER_AGENT_HEADER)
+        .header(ACCEPT, "application/vnd.github+json")
+        .bearer_auth(&profile.token)
+        .send()?
+        .error_for_status()?;
+    Ok(())
+}
+
 fn fetch_notifications(
     client: &Client,
     profile: &GitHubAccount,

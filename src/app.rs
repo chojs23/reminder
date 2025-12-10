@@ -331,6 +331,8 @@ fn render_account_body(group: &mut egui::Ui, account: &mut AccountState) {
         for action in actions {
             match action {
                 AccountAction::MarkNotificationDone(id) => account.request_mark_done(id),
+                AccountAction::MarkNotificationSeen(id) => account.mark_notification_seen(&id),
+                AccountAction::MarkNotificationRead(id) => account.request_mark_read(id),
             }
         }
     }
@@ -543,9 +545,39 @@ impl AccountState {
                 .find(|item| item.thread_id == thread_id)
             {
                 item.unread = false;
+                // Consider the thread freshly read at the current timestamp so the
+                // "Updated" badge clears unless new events arrive.
+                item.last_read_at = Some(Utc::now());
             }
         }
         self.inflight_done.remove(thread_id);
+    }
+
+    /// Mark a thread as seen the moment the user opens it so the UI reflects
+    /// the visit without waiting for the next GitHub sync cycle.
+    fn mark_notification_seen(&mut self, thread_id: &str) {
+        if let Some(inbox) = &mut self.inbox {
+            if let Some(item) = inbox
+                .notifications
+                .iter_mut()
+                .find(|item| item.thread_id == thread_id)
+            {
+                item.unread = false;
+                // Advance the local last_read_at to the newest update to clear the
+                // "Updated" badge unless more activity arrives later.
+                item.last_read_at = Some(item.updated_at);
+            }
+        }
+    }
+
+    fn request_mark_read(&mut self, thread_id: String) {
+        if self.inflight_done.contains(&thread_id) {
+            return;
+        }
+        let profile = self.profile.clone();
+        let job = NotificationActionJob::mark_read(profile, thread_id.clone());
+        self.pending_actions.push(job);
+        self.inflight_done.insert(thread_id);
     }
 
     fn request_mark_done(&mut self, thread_id: String) {
@@ -619,6 +651,23 @@ impl NotificationActionJob {
         Ok(thread_id)
     }
 
+    fn mark_read(profile: GitHubAccount, thread_id: String) -> Self {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = Self::mark_read_worker(profile, thread_id);
+            let _ = tx.send(outcome);
+        });
+        Self { receiver: rx }
+    }
+
+    fn mark_read_worker(profile: GitHubAccount, thread_id: String) -> NotificationActionResult {
+        let client =
+            github::build_client().map_err(|err| (Some(thread_id.clone()), err.to_string()))?;
+        github::mark_notification_read(&client, &profile, &thread_id)
+            .map_err(|err| (Some(thread_id.clone()), err.to_string()))?;
+        Ok(thread_id)
+    }
+
     fn try_take(&self) -> Option<NotificationActionResult> {
         match self.receiver.try_recv() {
             Ok(result) => Some(result),
@@ -649,16 +698,20 @@ fn render_notification_section<'a>(
         "{title} ({} unseen, {} updated)",
         unseen_count, updated_count
     );
+    let header = egui::CollapsingHeader::new(heading)
+        // Keep the collapsing state stable even as counts in the title change.
+        .id_salt(format!("notification-section-{title}"))
+        .default_open(true);
 
     if subset.is_empty() {
-        group.collapsing(heading, |section| {
+        header.show(group, |section| {
             section.weak(empty_label);
         });
         return Vec::new();
     }
 
     let mut actions = Vec::new();
-    group.collapsing(heading, |section| {
+    header.show(group, |section| {
         actions.extend(draw_notifications(
             section,
             &subset,
@@ -730,7 +783,7 @@ fn draw_notifications(
     inflight_done: &HashSet<String>,
     allow_done_action: bool,
 ) -> Vec<AccountAction> {
-    let actions = Vec::new();
+    let mut actions = Vec::new();
     let rows: Vec<_> = items
         .iter()
         .copied()
@@ -773,9 +826,19 @@ fn draw_notifications(
                         ui.horizontal(|row_ui| {
                             let subject = notification_text(row_ui, &item.title, visual);
                             if let Some(url) = &item.url {
-                                row_ui.hyperlink_to(subject, url);
+                                let resp = row_ui.hyperlink_to(subject, url);
+                                if resp.clicked() {
+                                    actions.push(AccountAction::MarkNotificationSeen(
+                                        item.thread_id.clone(),
+                                    ));
+                                }
                             } else {
-                                row_ui.label(subject);
+                                let resp = row_ui.label(subject);
+                                if resp.clicked() {
+                                    actions.push(AccountAction::MarkNotificationSeen(
+                                        item.thread_id.clone(),
+                                    ));
+                                }
                             }
                             if visual.needs_revisit {
                                 row_ui.small(
@@ -799,11 +862,22 @@ fn draw_notifications(
                         ));
                     });
                     row.col(|ui| {
-                        // Done actions are disabled because GitHub's notifications API
-                        // does not expose a dedicated "done" filter. Keep the column as
-                        // a placeholder to preserve layout, but skip the button.
-                        let _ = (allow_done_action, inflight_done);
-                        ui.weak("—");
+                        let busy = inflight_done.contains(&item.thread_id);
+                        let already_read = !item.unread && !visual.needs_revisit;
+
+                        if ui
+                            .add_enabled(!busy && !already_read, egui::Button::new("Mark read"))
+                            .clicked()
+                        {
+                            actions
+                                .push(AccountAction::MarkNotificationRead(item.thread_id.clone()));
+                        }
+
+                        // Keep layout width consistent even when disabled.
+                        if busy {
+                            ui.spinner();
+                        }
+                        let _ = allow_done_action;
                     });
                 });
             }
@@ -818,6 +892,8 @@ fn draw_notifications(
 #[allow(dead_code)]
 enum AccountAction {
     MarkNotificationDone(String),
+    MarkNotificationSeen(String),
+    MarkNotificationRead(String),
 }
 
 #[derive(Default)]
