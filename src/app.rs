@@ -323,11 +323,7 @@ fn render_account_body(group: &mut egui::Ui, account: &mut AccountState) {
     if account.inbox.is_some() {
         group.separator();
         let filter = SearchFilter::new(&account.search_query);
-        let actions = {
-            let inflight_done = account.inflight_done.clone();
-            let inbox = account.inbox.as_ref().expect("checked above");
-            render_account_sections(group, inbox, &filter, &inflight_done)
-        };
+        let actions = render_account_sections(group, account, &filter);
         for action in actions {
             match action {
                 AccountAction::MarkNotificationDone(id) => account.request_mark_done(id),
@@ -340,9 +336,8 @@ fn render_account_body(group: &mut egui::Ui, account: &mut AccountState) {
 
 fn render_account_sections(
     group: &mut egui::Ui,
-    inbox: &InboxSnapshot,
+    account: &mut AccountState,
     filter: &SearchFilter,
-    inflight_done: &HashSet<String>,
 ) -> Vec<AccountAction> {
     const REVIEW_REQUEST_REASON: &str = "review_requested";
     const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
@@ -350,6 +345,9 @@ fn render_account_sections(
     // Show both seen and unseen items in their contextual buckets; the Done section
     // is temporarily disabled to avoid splitting the feed.
     let mut actions = Vec::new();
+    let inflight_done = account.inflight_done.clone();
+    let inbox = account.inbox.as_ref().expect("checked by caller");
+
     let review_requests: Vec<_> = inbox
         .notifications
         .iter()
@@ -362,8 +360,12 @@ fn render_account_sections(
         review_requests,
         "No pending review requests.",
         filter,
-        inflight_done,
+        &inflight_done,
         true,
+        account.highlights.contains(&SectionKind::ReviewRequests),
+        || {
+            account.highlights.remove(&SectionKind::ReviewRequests);
+        },
     ));
     group.separator();
 
@@ -378,8 +380,12 @@ fn render_account_sections(
         mentions,
         "No recent mentions.",
         filter,
-        inflight_done,
+        &inflight_done,
         true,
+        account.highlights.contains(&SectionKind::Mentions),
+        || {
+            account.highlights.remove(&SectionKind::Mentions);
+        },
     ));
     group.separator();
 
@@ -396,8 +402,12 @@ fn render_account_sections(
         other,
         "You're all caught up 🎉",
         filter,
-        inflight_done,
+        &inflight_done,
         true,
+        account.highlights.contains(&SectionKind::Notifications),
+        || {
+            account.highlights.remove(&SectionKind::Notifications);
+        },
     ));
 
     actions
@@ -475,6 +485,7 @@ struct AccountState {
     expanded: bool,
     search_query: String,
     inflight_done: HashSet<String>,
+    highlights: HashSet<SectionKind>,
 }
 
 impl AccountState {
@@ -488,6 +499,7 @@ impl AccountState {
             expanded: true,
             search_query: String::new(),
             inflight_done: HashSet::new(),
+            highlights: HashSet::new(),
         }
     }
 
@@ -503,6 +515,23 @@ impl AccountState {
                 self.pending_job = None;
                 match result {
                     Ok(inbox) => {
+                        let previous_stats = self.inbox.as_ref().map(section_stats);
+                        let next_stats = section_stats(&inbox);
+                        if let Some(old) = previous_stats {
+                            if next_stats
+                                .review_requests
+                                .bumped_since(&old.review_requests)
+                            {
+                                self.highlights.insert(SectionKind::ReviewRequests);
+                            }
+                            if next_stats.mentions.bumped_since(&old.mentions) {
+                                self.highlights.insert(SectionKind::Mentions);
+                            }
+                            if next_stats.notifications.bumped_since(&old.notifications) {
+                                self.highlights.insert(SectionKind::Notifications);
+                            }
+                        }
+
                         self.inbox = Some(inbox);
                         self.last_error = None;
                     }
@@ -684,7 +713,7 @@ impl NotificationActionJob {
 // UI helpers
 // -----------------------------------------------------------------------------
 
-fn render_notification_section<'a>(
+fn render_notification_section<'a, F: FnMut()>(
     group: &mut egui::Ui,
     title: &str,
     subset: Vec<&'a NotificationItem>,
@@ -692,26 +721,38 @@ fn render_notification_section<'a>(
     filter: &SearchFilter,
     inflight_done: &HashSet<String>,
     allow_done_action: bool,
+    highlight: bool,
+    mut clear_highlight: F,
 ) -> Vec<AccountAction> {
     let (unseen_count, updated_count) = summarize_counts(&subset);
     let heading = format!(
         "{title} ({} unseen, {} updated)",
         unseen_count, updated_count
     );
-    let header = egui::CollapsingHeader::new(heading)
+    let heading_text = if highlight {
+        RichText::new(heading.clone())
+            .strong()
+            .color(group.visuals().warn_fg_color)
+    } else {
+        RichText::new(heading.clone()).strong()
+    };
+    let header = egui::CollapsingHeader::new(heading_text)
         // Keep the collapsing state stable even as counts in the title change.
         .id_salt(format!("notification-section-{title}"))
         .default_open(true);
 
     if subset.is_empty() {
-        header.show(group, |section| {
+        let response = header.show(group, |section| {
             section.weak(empty_label);
         });
+        if response.body_returned.is_some() && highlight {
+            clear_highlight();
+        }
         return Vec::new();
     }
 
     let mut actions = Vec::new();
-    header.show(group, |section| {
+    let response = header.show(group, |section| {
         actions.extend(draw_notifications(
             section,
             &subset,
@@ -720,6 +761,9 @@ fn render_notification_section<'a>(
             allow_done_action,
         ));
     });
+    if response.body_returned.is_some() && highlight {
+        clear_highlight();
+    }
     actions
 }
 
@@ -736,6 +780,60 @@ fn summarize_counts(items: &[&NotificationItem]) -> (usize, usize) {
         }
     }
     (unseen, updated)
+}
+
+struct SectionCounts {
+    unseen: usize,
+    updated: usize,
+}
+
+impl SectionCounts {
+    fn new(unseen: usize, updated: usize) -> Self {
+        Self { unseen, updated }
+    }
+
+    fn bumped_since(&self, previous: &SectionCounts) -> bool {
+        self.unseen > previous.unseen || self.updated > previous.updated
+    }
+}
+
+struct SectionStats {
+    review_requests: SectionCounts,
+    mentions: SectionCounts,
+    notifications: SectionCounts,
+}
+
+fn section_stats(inbox: &InboxSnapshot) -> SectionStats {
+    const REVIEW_REQUEST_REASON: &str = "review_requested";
+    const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
+
+    let review_requests: Vec<_> = inbox
+        .notifications
+        .iter()
+        .filter(|item| item.reason == REVIEW_REQUEST_REASON)
+        .collect();
+    let mentions: Vec<_> = inbox
+        .notifications
+        .iter()
+        .filter(|item| MENTION_REASONS.contains(&item.reason.as_str()))
+        .collect();
+    let other: Vec<_> = inbox
+        .notifications
+        .iter()
+        .filter(|item| {
+            item.reason != REVIEW_REQUEST_REASON && !MENTION_REASONS.contains(&item.reason.as_str())
+        })
+        .collect();
+
+    let (rr_unseen, rr_updated) = summarize_counts(&review_requests);
+    let (m_unseen, m_updated) = summarize_counts(&mentions);
+    let (o_unseen, o_updated) = summarize_counts(&other);
+
+    SectionStats {
+        review_requests: SectionCounts::new(rr_unseen, rr_updated),
+        mentions: SectionCounts::new(m_unseen, m_updated),
+        notifications: SectionCounts::new(o_unseen, o_updated),
+    }
 }
 
 // Highlight notifications that churned after the last time we read the thread so
@@ -902,6 +1000,13 @@ enum AccountAction {
     MarkNotificationDone(String),
     MarkNotificationSeen(String),
     MarkNotificationRead(String),
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum SectionKind {
+    ReviewRequests,
+    Mentions,
+    Notifications,
 }
 
 #[derive(Default)]
