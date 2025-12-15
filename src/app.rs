@@ -1078,6 +1078,8 @@ impl SearchFilter {
 mod tests {
     use super::*;
     use chrono::{DateTime, NaiveDateTime, Utc};
+    use eframe::egui;
+    use eframe::egui::collapsing_header::CollapsingState;
 
     fn parse_utc(ts: &str) -> DateTime<Utc> {
         NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
@@ -1105,6 +1107,13 @@ mod tests {
             mentions: Vec::new(),
             recent_reviews: Vec::new(),
             fetched_at: Utc::now(),
+        }
+    }
+
+    fn dummy_profile() -> GitHubAccount {
+        GitHubAccount {
+            login: "user".into(),
+            token: "token".into(),
         }
     }
 
@@ -1158,5 +1167,70 @@ mod tests {
         let visual = notification_state(&item);
         assert!(visual.needs_revisit);
         assert!(!visual.seen);
+    }
+
+    #[test]
+    fn highlight_clears_after_rendering_section() {
+        let ctx = egui::Context::default();
+        let mut account = AccountState::new(dummy_profile());
+        account.inbox = Some(inbox_with_notifications(vec![notif(
+            "t1",
+            "subscribed",
+            true,
+            "2024-01-01 00:00:00",
+        )]));
+        account.highlights.insert(SectionKind::Notifications);
+        let filter = SearchFilter::new("");
+
+        ctx.begin_pass(Default::default());
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let _ = render_account_sections(ui, &mut account, &filter);
+        });
+        let _ = ctx.end_pass();
+
+        assert!(
+            !account.highlights.contains(&SectionKind::Notifications),
+            "Highlight should clear after section is rendered"
+        );
+    }
+
+    #[test]
+    fn collapsing_header_state_persists_across_frames() {
+        let ctx = egui::Context::default();
+        let mut account = AccountState::new(dummy_profile());
+        account.inbox = Some(inbox_with_notifications(vec![notif(
+            "t1",
+            "subscribed",
+            true,
+            "2024-01-01 00:00:00",
+        )]));
+        let filter = SearchFilter::new("");
+
+        // Frame 1: render and manually collapse the notifications section.
+        ctx.begin_pass(Default::default());
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let _ = render_account_sections(ui, &mut account, &filter);
+        });
+        let id = egui::Id::new("notification-section-Notifications");
+        let mut state = CollapsingState::load_with_default_open(&ctx, id, true);
+        state.set_open(false);
+        state.store(&ctx);
+        let _ = ctx.end_pass();
+
+        // Frame 2: re-render; section should remain collapsed because ID is stable.
+        ctx.begin_pass(Default::default());
+        let mut stayed_collapsed = true;
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let response = render_account_sections(ui, &mut account, &filter);
+            let state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+            stayed_collapsed = !state.is_open();
+            assert!(response.is_empty(), "Rendering should not trigger actions");
+        });
+        let _ = ctx.end_pass();
+
+        assert!(
+            stayed_collapsed,
+            "Collapse state should persist across frames"
+        );
     }
 }
