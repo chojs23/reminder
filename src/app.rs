@@ -5,6 +5,7 @@ mod review;
 mod scheduler;
 mod search;
 mod state;
+mod time;
 mod ui;
 
 use std::{collections::BTreeMap, fs, time::Duration};

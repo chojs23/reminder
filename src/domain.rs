@@ -66,7 +66,11 @@ impl NotificationItem {
         match self.thread_number() {
             Some(number) => {
                 let prefix = format!("#{number} ");
-                format!("{}{}", prefix, self.title)
+                if self.title.starts_with(&prefix) {
+                    self.title.clone()
+                } else {
+                    format!("{}{}", prefix, self.title)
+                }
             }
             None => self.title.clone(),
         }
@@ -230,14 +234,14 @@ mod tests {
     fn display_title_appends_pull_request_number_as_suffix() {
         let item = notification(Some("https://github.com/acme/repo/pull/123"));
 
-        assert_eq!(item.display_title(), "Title #123");
+        assert_eq!(item.display_title(), "#123 Title");
     }
 
     #[test]
     fn display_title_appends_issue_number_as_suffix() {
         let item = notification(Some("https://github.com/acme/repo/issues/321"));
 
-        assert_eq!(item.display_title(), "Title #321");
+        assert_eq!(item.display_title(), "#321 Title");
     }
 
     #[test]

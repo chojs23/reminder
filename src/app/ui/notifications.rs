@@ -14,6 +14,7 @@ use super::super::{
     review::custom_review_available_for_repo,
     search::SearchFilter,
     state::AccountState,
+    time::format_local_timestamp,
 };
 use super::layout::uses_compact_notifications;
 
@@ -283,7 +284,7 @@ fn draw_notification_cards(
                     row.separator();
                     row.label(notification_text(
                         row,
-                        item.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+                        format_local_timestamp(item.updated_at, "%Y-%m-%d %H:%M"),
                         visual,
                     ));
                     if visual.needs_revisit {
@@ -475,7 +476,7 @@ fn draw_notification_table(
                             row.col(|ui| {
                                 ui.label(notification_text(
                                     ui,
-                                    item.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+                                    format_local_timestamp(item.updated_at, "%Y-%m-%d %H:%M"),
                                     visual,
                                 ));
                             });

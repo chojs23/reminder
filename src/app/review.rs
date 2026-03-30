@@ -16,6 +16,7 @@ use std::{
 use chrono::Utc;
 use eframe::egui::{self, Context};
 
+use super::time::format_local_timestamp;
 use super::{CUSTOM_REVIEW_COMMAND_NAME, MAX_REVIEW_OUTPUT_CHARS, repo_paths::canonical_repo_key};
 use crate::domain::ReviewCommandSettings;
 
@@ -480,10 +481,10 @@ pub(super) fn review_summary_text(review_output: &ReviewOutputState) -> String {
 
     match review_output.captured_at {
         Some(captured_at) => format!(
-            "{status}: {} via {} at {} UTC",
+            "{status}: {} via {} at {}",
             review_output.target,
             review_output.command_label,
-            captured_at.format("%Y-%m-%d %H:%M:%S")
+            format_local_timestamp(captured_at, "%Y-%m-%d %H:%M:%S %:z")
         ),
         None => format!(
             "{status}: {} via {}",

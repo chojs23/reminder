@@ -8,6 +8,7 @@ use super::{
         review::{resolve_review_launch, review_summary_text},
         search::SearchFilter,
         state::AccountState,
+        time::format_local_timestamp,
     },
     layout::uses_stacked_account_header,
     notifications::{render_bucket_sections, render_unified_inbox_section},
@@ -91,8 +92,8 @@ fn render_view_mode_toggle(ui: &mut egui::Ui, account: &mut AccountState) {
 fn render_account_status(group: &mut egui::Ui, account: &mut AccountState) {
     if let Some(inbox) = &account.inbox {
         group.label(format!(
-            "Last synced {} UTC",
-            inbox.fetched_at.format("%Y-%m-%d %H:%M:%S")
+            "Last synced {}",
+            format_local_timestamp(inbox.fetched_at, "%Y-%m-%d %H:%M:%S %:z")
         ));
     } else {
         group.label("No data fetched yet.");
