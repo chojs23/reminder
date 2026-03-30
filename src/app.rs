@@ -76,6 +76,7 @@ const AUTO_REFRESH_INTERVAL_SECS: u64 = 180;
 pub struct ReminderApp {
     account_form: AccountForm,
     repo_path_form: RepoPathForm,
+    account_delete_confirmation: Option<AccountDeleteConfirmation>,
     review_settings_editor: Option<AccountReviewSettingsEditor>,
     accounts: Vec<AccountState>,
     repo_paths: BTreeMap<String, String>,
@@ -93,6 +94,7 @@ impl ReminderApp {
         let mut app = Self {
             account_form: AccountForm::default(),
             repo_path_form: RepoPathForm::default(),
+            account_delete_confirmation: None,
             review_settings_editor: None,
             accounts: Vec::new(),
             repo_paths: BTreeMap::new(),
@@ -200,6 +202,7 @@ impl ReminderApp {
             && let Err(err) = store.forget(&login)
         {
             self.global_error = Some(format!("Failed to remove credentials for {login}: {err}"));
+            return;
         }
 
         if self
@@ -209,9 +212,40 @@ impl ReminderApp {
         {
             self.review_settings_editor = None;
         }
+        if self
+            .account_delete_confirmation
+            .as_ref()
+            .is_some_and(|confirmation| confirmation.login == login)
+        {
+            self.account_delete_confirmation = None;
+        }
 
         self.accounts.remove(idx);
         self.ensure_selected_account();
+    }
+
+    fn open_account_delete_confirmation(&mut self, login: &str) {
+        self.account_delete_confirmation = Some(AccountDeleteConfirmation {
+            login: login.to_owned(),
+            typed_login: String::new(),
+        });
+    }
+
+    fn confirm_account_delete_matches(expected_login: &str, typed_login: &str) -> bool {
+        typed_login.trim() == expected_login
+    }
+
+    fn remove_account_by_login(&mut self, login: &str) {
+        if let Some(idx) = self
+            .accounts
+            .iter()
+            .position(|account| account.profile.login == login)
+        {
+            self.remove_account_at(idx);
+        } else {
+            self.account_delete_confirmation = None;
+            self.global_error = Some(format!("Cannot find tracked account {login} to remove."));
+        }
     }
 
     fn save_repo_path(&mut self) {
@@ -390,6 +424,60 @@ impl ReminderApp {
         }
     }
 
+    fn render_account_delete_confirmation_window(&mut self, ctx: &Context) {
+        let Some(confirmation) = self.account_delete_confirmation.as_mut() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut delete_requested = false;
+        let mut cancel_requested = false;
+        let typed_matches =
+            Self::confirm_account_delete_matches(&confirmation.login, &confirmation.typed_login);
+        let title = format!("Delete account: {}", confirmation.login);
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_size(egui::vec2(420.0, 180.0))
+            .show(ctx, |ui| {
+                ui.label("Type the exact account name to confirm deletion.");
+                ui.monospace(&confirmation.login);
+                ui.add_space(8.0);
+                ui.label("Account name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut confirmation.typed_login)
+                        .desired_width(f32::INFINITY),
+                );
+                if !typed_matches && !confirmation.typed_login.is_empty() {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "Typed account name does not match.",
+                    );
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|row| {
+                    if row
+                        .add_enabled(typed_matches, egui::Button::new("Delete account"))
+                        .clicked()
+                    {
+                        delete_requested = true;
+                    }
+                    if row.button("Cancel").clicked() {
+                        cancel_requested = true;
+                    }
+                });
+            });
+
+        if delete_requested {
+            let login = confirmation.login.clone();
+            self.remove_account_by_login(&login);
+        } else if cancel_requested || !open {
+            self.account_delete_confirmation = None;
+        }
+    }
+
     fn remove_repo_path(&mut self, repo: &str) {
         if let Some(store) = &self.secret_store
             && let Err(err) = store.forget_repo_path(repo)
@@ -501,7 +589,7 @@ impl ReminderApp {
             let compact_rows = uses_compact_account_rows(ui.available_width());
             let mut selected_login = None;
             let mut refresh_idx = None;
-            let mut remove_idx = None;
+            let mut remove_login = None;
             let mut settings_login = None;
             for (idx, account) in self.accounts.iter_mut().enumerate() {
                 let overview = account_overview(account);
@@ -526,7 +614,7 @@ impl ReminderApp {
                                 settings_login = Some(account.profile.login.clone());
                             }
                             if row.small_button("Remove").clicked() {
-                                remove_idx = Some(idx);
+                                remove_login = Some(account.profile.login.clone());
                             }
                         });
                     } else {
@@ -539,7 +627,7 @@ impl ReminderApp {
                                 settings_login = Some(account.profile.login.clone());
                             }
                             if row.small_button("Remove").clicked() {
-                                remove_idx = Some(idx);
+                                remove_login = Some(account.profile.login.clone());
                             }
                         });
                     }
@@ -551,14 +639,14 @@ impl ReminderApp {
             if let Some(login) = settings_login {
                 self.open_review_settings_editor(&login);
             }
+            if let Some(login) = remove_login {
+                self.open_account_delete_confirmation(&login);
+            }
             if let Some(idx) = refresh_idx
                 && let Some(account) = self.accounts.get_mut(idx)
             {
                 account.start_refresh();
                 self.auto_refresh.mark_triggered();
-            }
-            if let Some(idx) = remove_idx {
-                self.remove_account_at(idx);
             }
         }
 
@@ -667,6 +755,7 @@ impl App for ReminderApp {
             self.render_dashboard(ui);
         });
 
+        self.render_account_delete_confirmation_window(ctx);
         self.render_review_settings_window(ctx);
 
         for account in &mut self.accounts {
@@ -736,6 +825,11 @@ struct AccountReviewSettingsEditor {
     env_vars_text: String,
     additional_args_text: String,
     form_error: Option<String>,
+}
+
+struct AccountDeleteConfirmation {
+    login: String,
+    typed_login: String,
 }
 
 fn format_review_env_vars(settings: &ReviewCommandSettings) -> String {
@@ -912,6 +1006,7 @@ mod tests {
         ReminderApp {
             account_form: AccountForm::default(),
             repo_path_form: RepoPathForm::default(),
+            account_delete_confirmation: None,
             review_settings_editor: None,
             accounts: logins.iter().map(|login| make_account(login)).collect(),
             repo_paths: BTreeMap::new(),
@@ -1005,6 +1100,32 @@ mod tests {
         app.ensure_selected_account();
 
         assert_eq!(app.selected_account_login.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn confirm_account_delete_matches_trimmed_exact_login() {
+        assert!(ReminderApp::confirm_account_delete_matches(
+            "alpha", "alpha"
+        ));
+        assert!(ReminderApp::confirm_account_delete_matches(
+            "alpha", " alpha "
+        ));
+        assert!(!ReminderApp::confirm_account_delete_matches(
+            "alpha", "beta"
+        ));
+    }
+
+    #[test]
+    fn remove_account_at_clears_matching_delete_confirmation() {
+        let mut app = app_with_accounts(&["alpha", "beta"]);
+        app.account_delete_confirmation = Some(AccountDeleteConfirmation {
+            login: String::from("alpha"),
+            typed_login: String::from("alpha"),
+        });
+
+        app.remove_account_at(0);
+
+        assert!(app.account_delete_confirmation.is_none());
     }
 
     #[test]
