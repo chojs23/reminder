@@ -18,7 +18,7 @@ use eframe::{
 use self::{
     fonts::install_international_fonts,
     repo_paths::{canonical_repo_key, normalize_hydrated_repo_paths},
-    review::{custom_review_command_available, render_review_window},
+    review::{ReviewWindowAction, custom_review_command_available, render_review_window},
     scheduler::BatchRefreshScheduler,
     state::AccountState,
     ui::{
@@ -760,8 +760,21 @@ impl App for ReminderApp {
         self.render_review_settings_window(ctx);
 
         for account in &mut self.accounts {
+            let mut review_window_actions = Vec::new();
             for review_output in account.review_outputs.values_mut() {
-                render_review_window(ctx, &account.profile.login, review_output);
+                if let Some(action) =
+                    render_review_window(ctx, &account.profile.login, review_output)
+                {
+                    review_window_actions.push(action);
+                }
+            }
+
+            for action in review_window_actions {
+                match action {
+                    ReviewWindowAction::SendFollowUp { thread_id } => {
+                        account.request_review_follow_up(&thread_id)
+                    }
+                }
             }
         }
 
@@ -1271,7 +1284,7 @@ mod tests {
             },
         );
 
-        append_review_chunk(&mut review_output, &"a".repeat(MAX_REVIEW_OUTPUT_CHARS));
+        append_review_chunk(&mut review_output, "a".repeat(MAX_REVIEW_OUTPUT_CHARS));
         append_review_chunk(&mut review_output, "TAIL");
 
         assert_eq!(review_output.dropped_chars, 0);

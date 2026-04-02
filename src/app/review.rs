@@ -39,8 +39,14 @@ static SHELL_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub(super) struct ReviewOutputState {
     pub(super) thread_id: String,
     pub(super) target: String,
+    pub(super) repo_path: String,
     pub(super) command_label: String,
     pub(super) captured_at: Option<chrono::DateTime<Utc>>,
+    pub(super) session_id: Option<String>,
+    pub(super) review_settings: ReviewCommandSettings,
+    pub(super) follow_up_draft: String,
+    pub(super) follow_up_error: Option<String>,
+    pub(super) pending_follow_up_prompt: Option<String>,
     terminal: TerminalParser,
     styled_spans: Vec<ReviewStyledSpan>,
     pub(super) open: bool,
@@ -97,15 +103,18 @@ pub(super) enum ReviewJobMessage {
     FinishedSuccess {
         thread_id: String,
         captured_at: chrono::DateTime<Utc>,
+        session_id: Option<String>,
     },
     FinishedCancelled {
         thread_id: String,
         captured_at: chrono::DateTime<Utc>,
+        session_id: Option<String>,
         _message: String,
     },
     FinishedFailure {
         thread_id: String,
         captured_at: chrono::DateTime<Utc>,
+        session_id: Option<String>,
         message: String,
     },
 }
@@ -118,14 +127,25 @@ pub(super) struct ReviewJob {
 }
 
 enum ReviewRunOutcome {
-    Completed,
-    Cancelled { message: String },
+    Completed {
+        session_id: Option<String>,
+    },
+    Cancelled {
+        message: String,
+        session_id: Option<String>,
+    },
+}
+
+struct ReviewRunFailure {
+    message: String,
+    session_id: Option<String>,
 }
 
 #[derive(Default)]
 struct ReviewCommandCapture {
     output: String,
     saw_text_response: bool,
+    session_id: Option<String>,
 }
 
 enum ReviewShellDestination {
@@ -136,6 +156,14 @@ enum ReviewShellDestination {
 struct ReviewShellMirror {
     destination: ReviewShellDestination,
     review_label: String,
+}
+
+struct ReviewRunContext<'a> {
+    tx: &'a mpsc::Sender<ReviewJobMessage>,
+    thread_id: &'a str,
+    review_label: &'a str,
+    child_handle: Arc<Mutex<Option<Child>>>,
+    cancel_requested: Arc<AtomicBool>,
 }
 
 impl ReviewShellMirror {
@@ -202,6 +230,7 @@ fn review_shell_label(launch: &ReviewLaunchPlan) -> String {
         ReviewLaunchPlan::Custom {
             repo, pr_number, ..
         } => format!("{repo}#{pr_number}"),
+        ReviewLaunchPlan::FollowUp { target, .. } => target.clone(),
     }
 }
 
@@ -348,6 +377,13 @@ fn review_json_string_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str>
         current = current.get(*key)?;
     }
     current.as_str()
+}
+
+fn review_event_session_id(event: &Value) -> Option<&str> {
+    event
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .or_else(|| review_json_string_at(event, &["part", "sessionID"]))
 }
 
 fn format_review_tool_event(part: &Value) -> Option<String> {
@@ -648,8 +684,9 @@ fn rebuild_review_output_from_terminal(review_output: &mut ReviewOutputState) {
     };
 
     let mut parser_state = ReviewAnsiParserState::default();
-    for row_idx in 0..=last_row.min(usize::from(rows.saturating_sub(1))) {
-        let formatted_row = String::from_utf8_lossy(&formatted_rows[row_idx]);
+    let last_row = last_row.min(usize::from(rows.saturating_sub(1)));
+    for (row_idx, formatted_row) in formatted_rows.iter().enumerate().take(last_row + 1) {
+        let formatted_row = String::from_utf8_lossy(formatted_row);
         append_ansi_snapshot(
             &mut review_output.styled_spans,
             &mut parser_state,
@@ -726,20 +763,29 @@ impl ReviewJob {
                 worker_cancel_requested,
             );
             let message = match outcome {
-                Ok(ReviewRunOutcome::Completed) => ReviewJobMessage::FinishedSuccess {
-                    thread_id: worker_thread_id.clone(),
-                    captured_at: Utc::now(),
-                },
-                Ok(ReviewRunOutcome::Cancelled { message }) => {
-                    ReviewJobMessage::FinishedCancelled {
+                Ok(ReviewRunOutcome::Completed { session_id }) => {
+                    ReviewJobMessage::FinishedSuccess {
                         thread_id: worker_thread_id.clone(),
                         captured_at: Utc::now(),
-                        _message: message,
+                        session_id,
                     }
                 }
-                Err(message) => ReviewJobMessage::FinishedFailure {
+                Ok(ReviewRunOutcome::Cancelled {
+                    message,
+                    session_id,
+                }) => ReviewJobMessage::FinishedCancelled {
+                    thread_id: worker_thread_id.clone(),
+                    captured_at: Utc::now(),
+                    session_id,
+                    _message: message,
+                },
+                Err(ReviewRunFailure {
+                    message,
+                    session_id,
+                }) => ReviewJobMessage::FinishedFailure {
                     thread_id: worker_thread_id,
                     captured_at: Utc::now(),
+                    session_id,
                     message,
                 },
             };
@@ -813,6 +859,7 @@ impl ReviewJob {
                     messages.push(ReviewJobMessage::FinishedFailure {
                         thread_id: self.thread_id.clone(),
                         captured_at: Utc::now(),
+                        session_id: None,
                         message: "Review worker disconnected unexpectedly.".to_owned(),
                     });
                     finished = true;
@@ -833,6 +880,17 @@ pub(super) enum ReviewLaunchPlan {
         pr_number: u64,
         review_settings: ReviewCommandSettings,
     },
+    FollowUp {
+        target: String,
+        repo_path: String,
+        session_id: String,
+        prompt: String,
+        review_settings: ReviewCommandSettings,
+    },
+}
+
+pub(super) enum ReviewWindowAction {
+    SendFollowUp { thread_id: String },
 }
 
 fn run_review_stream(
@@ -841,8 +899,15 @@ fn run_review_stream(
     launch: &ReviewLaunchPlan,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
-) -> Result<ReviewRunOutcome, String> {
+) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let review_label = review_shell_label(launch);
+    let context = ReviewRunContext {
+        tx,
+        thread_id,
+        review_label: &review_label,
+        child_handle,
+        cancel_requested,
+    };
 
     match launch {
         ReviewLaunchPlan::Custom {
@@ -850,29 +915,23 @@ fn run_review_stream(
             pr_number,
             review_settings,
             ..
-        } => run_custom_review(
-            tx,
-            thread_id,
+        } => run_custom_review(context, repo_path, *pr_number, review_settings),
+        ReviewLaunchPlan::FollowUp {
             repo_path,
-            *pr_number,
+            session_id,
+            prompt,
             review_settings,
-            &review_label,
-            child_handle,
-            cancel_requested,
-        ),
+            ..
+        } => run_review_follow_up(context, repo_path, session_id, prompt, review_settings),
     }
 }
 
 fn run_custom_review(
-    tx: &mpsc::Sender<ReviewJobMessage>,
-    thread_id: &str,
+    context: ReviewRunContext<'_>,
     repo_path: &str,
     pr_number: u64,
     review_settings: &ReviewCommandSettings,
-    review_label: &str,
-    child_handle: Arc<Mutex<Option<Child>>>,
-    cancel_requested: Arc<AtomicBool>,
-) -> Result<ReviewRunOutcome, String> {
+) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -890,12 +949,44 @@ fn run_custom_review(
     command.args(&review_settings.additional_args);
     println!("Running custom review command: {:?}", command);
     stream_review_command(
-        tx,
-        thread_id,
-        review_label,
+        context.tx,
+        context.thread_id,
+        context.review_label,
         command,
-        child_handle,
-        cancel_requested,
+        context.child_handle,
+        context.cancel_requested,
+    )
+}
+
+fn run_review_follow_up(
+    context: ReviewRunContext<'_>,
+    repo_path: &str,
+    session_id: &str,
+    prompt: &str,
+    review_settings: &ReviewCommandSettings,
+) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    let mut command = Command::new("opencode");
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.envs(review_settings.env_vars.iter());
+    command.arg("run");
+    command.arg("--dir");
+    command.arg(repo_path);
+    command.arg("--format");
+    command.arg("json");
+    command.arg("--session");
+    command.arg(session_id);
+    command.arg("--");
+    command.arg(prompt);
+    println!("Running review follow-up command: {:?}", command);
+    stream_review_command(
+        context.tx,
+        context.thread_id,
+        context.review_label,
+        command,
+        context.child_handle,
+        context.cancel_requested,
     )
 }
 
@@ -966,7 +1057,12 @@ fn read_review_json_stream(
 
             let rendered = serde_json::from_str::<Value>(trimmed)
                 .ok()
-                .and_then(|event| render_review_json_event(&event, &mut capture))
+                .and_then(|event| {
+                    if capture.session_id.is_none() {
+                        capture.session_id = review_event_session_id(&event).map(str::to_owned);
+                    }
+                    render_review_json_event(&event, &mut capture)
+                })
                 .unwrap_or_else(|| format!("{trimmed}\n"));
             append_rendered_review_output(&mut capture, shell_mirror, tx, thread_id, &rendered);
         }
@@ -976,7 +1072,12 @@ fn read_review_json_stream(
     if !trailing.is_empty() {
         let rendered = serde_json::from_str::<Value>(trailing)
             .ok()
-            .and_then(|event| render_review_json_event(&event, &mut capture))
+            .and_then(|event| {
+                if capture.session_id.is_none() {
+                    capture.session_id = review_event_session_id(&event).map(str::to_owned);
+                }
+                render_review_json_event(&event, &mut capture)
+            })
             .unwrap_or_else(|| format!("{trailing}\n"));
         append_rendered_review_output(&mut capture, shell_mirror, tx, thread_id, &rendered);
     }
@@ -991,18 +1092,19 @@ fn stream_review_command(
     mut command: Command,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
-) -> Result<ReviewRunOutcome, String> {
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("Failed to start review: {err}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to capture stdout.".to_owned())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Failed to capture stderr.".to_owned())?;
+) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    let mut child = command.spawn().map_err(|err| ReviewRunFailure {
+        message: format!("Failed to start review: {err}"),
+        session_id: None,
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| ReviewRunFailure {
+        message: "Failed to capture stdout.".to_owned(),
+        session_id: None,
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| ReviewRunFailure {
+        message: "Failed to capture stderr.".to_owned(),
+        session_id: None,
+    })?;
 
     let shell_mirror = match ReviewShellMirror::connect(review_label.to_owned()) {
         Ok(mut shell_mirror) => {
@@ -1030,9 +1132,10 @@ fn stream_review_command(
     };
 
     {
-        let mut shared_child = child_handle
-            .lock()
-            .map_err(|_| "Review process lock poisoned unexpectedly.".to_owned())?;
+        let mut shared_child = child_handle.lock().map_err(|_| ReviewRunFailure {
+            message: "Review process lock poisoned unexpectedly.".to_owned(),
+            session_id: None,
+        })?;
         *shared_child = Some(child);
         if cancel_requested.load(Ordering::SeqCst)
             && let Some(child) = shared_child.as_mut()
@@ -1044,13 +1147,19 @@ fn stream_review_command(
                         || child
                             .try_wait()
                             .map_err(|wait_err| {
-                                format!(
-                                    "Failed to inspect review process after early stop failure: {wait_err}"
-                                )
-                            })?
+                                ReviewRunFailure {
+                                    message: format!(
+                                        "Failed to inspect review process after early stop failure: {wait_err}"
+                                    ),
+                                    session_id: None,
+                                }
+                    })?
                             .is_some() => {}
                 Err(err) => {
-                    return Err(format!("Failed to stop review: {err}"));
+                    return Err(ReviewRunFailure {
+                        message: format!("Failed to stop review: {err}"),
+                        session_id: None,
+                    });
                 }
             }
         }
@@ -1078,24 +1187,34 @@ fn stream_review_command(
         &shell_mirror,
         &cancel_requested,
         "output",
-    )?;
+    )
+    .map_err(|message| ReviewRunFailure {
+        message,
+        session_id: None,
+    })?;
 
     let status = {
-        let mut shared_child = child_handle
-            .lock()
-            .map_err(|_| "Review process lock poisoned unexpectedly.".to_owned())?;
-        let mut child = shared_child
-            .take()
-            .ok_or_else(|| "Review process handle missing while waiting.".to_owned())?;
+        let mut shared_child = child_handle.lock().map_err(|_| ReviewRunFailure {
+            message: "Review process lock poisoned unexpectedly.".to_owned(),
+            session_id: stdout_capture.session_id.clone(),
+        })?;
+        let mut child = shared_child.take().ok_or_else(|| ReviewRunFailure {
+            message: "Review process handle missing while waiting.".to_owned(),
+            session_id: stdout_capture.session_id.clone(),
+        })?;
         match child.wait() {
             Ok(status) => status,
             Err(err) if cancel_requested.load(Ordering::SeqCst) => {
                 return Ok(ReviewRunOutcome::Cancelled {
                     message: "Review canceled by user.".to_owned(),
+                    session_id: stdout_capture.session_id.clone(),
                 });
             }
             Err(err) => {
-                return Err(format!("Failed while waiting for review: {err}"));
+                return Err(ReviewRunFailure {
+                    message: format!("Failed while waiting for review: {err}"),
+                    session_id: stdout_capture.session_id.clone(),
+                });
             }
         }
     };
@@ -1105,14 +1224,20 @@ fn stream_review_command(
             if cancel_requested.load(Ordering::SeqCst) {
                 String::new()
             } else {
-                return Err(err);
+                return Err(ReviewRunFailure {
+                    message: err,
+                    session_id: stdout_capture.session_id.clone(),
+                });
             }
         }
         Err(_) => {
             if cancel_requested.load(Ordering::SeqCst) {
                 String::new()
             } else {
-                return Err("Failed to join opencode diagnostics reader.".to_owned());
+                return Err(ReviewRunFailure {
+                    message: "Failed to join opencode diagnostics reader.".to_owned(),
+                    session_id: stdout_capture.session_id.clone(),
+                });
             }
         }
     };
@@ -1121,28 +1246,34 @@ fn stream_review_command(
         finish_review_shell_stream(&shell_mirror, tx, thread_id, "cancelled");
         return Ok(ReviewRunOutcome::Cancelled {
             message: "Review canceled by user.".to_owned(),
+            session_id: stdout_capture.session_id.clone(),
         });
     }
 
     if status.success() {
         if !stdout_capture.saw_text_response {
             finish_review_shell_stream(&shell_mirror, tx, thread_id, "incomplete");
-            return Err(format_review_incomplete_output(
-                &stdout_capture.output,
-                &stderr_capture,
-            ));
+            return Err(ReviewRunFailure {
+                message: format_review_incomplete_output(&stdout_capture.output, &stderr_capture),
+                session_id: stdout_capture.session_id,
+            });
         }
         finish_review_shell_stream(&shell_mirror, tx, thread_id, "completed");
-        return Ok(ReviewRunOutcome::Completed);
+        return Ok(ReviewRunOutcome::Completed {
+            session_id: stdout_capture.session_id,
+        });
     }
 
     finish_review_shell_stream(&shell_mirror, tx, thread_id, "failed");
 
-    Err(format_review_failure_output(
-        &status.to_string(),
-        &stdout_capture.output,
-        &stderr_capture,
-    ))
+    Err(ReviewRunFailure {
+        message: format_review_failure_output(
+            &status.to_string(),
+            &stdout_capture.output,
+            &stderr_capture,
+        ),
+        session_id: stdout_capture.session_id,
+    })
 }
 
 fn format_review_incomplete_output(stdout: &str, stderr: &str) -> String {
@@ -1205,18 +1336,30 @@ pub(super) fn initial_review_output_state(
 ) -> ReviewOutputState {
     match launch {
         ReviewLaunchPlan::Custom {
-            repo, pr_number, ..
+            repo,
+            repo_path,
+            pr_number,
+            review_settings,
         } => ReviewOutputState {
             thread_id,
             target: format!("{repo}#{pr_number}"),
+            repo_path: repo_path.clone(),
             command_label: String::from(CUSTOM_REVIEW_COMMAND_NAME),
             captured_at: None,
+            session_id: None,
+            review_settings: review_settings.clone(),
+            follow_up_draft: String::new(),
+            follow_up_error: None,
+            pending_follow_up_prompt: None,
             terminal: new_review_terminal(),
             styled_spans: Vec::new(),
             open: true,
             status: ReviewStatus::Running,
             dropped_chars: 0,
         },
+        ReviewLaunchPlan::FollowUp { .. } => {
+            unreachable!("follow-up launches reuse the existing review state")
+        }
     }
 }
 
@@ -1247,13 +1390,18 @@ pub(super) fn review_summary_text(review_output: &ReviewOutputState) -> String {
     }
 }
 
+pub(super) fn append_review_follow_up_prompt(review_output: &mut ReviewOutputState, prompt: &str) {
+    let formatted = format!("\n\n[Follow-up]\n{}\n\n", prompt.trim());
+    append_review_chunk(review_output, formatted);
+}
+
 pub(super) fn render_review_window(
     ctx: &Context,
     account_login: &str,
     review_output: &mut ReviewOutputState,
-) {
+) -> Option<ReviewWindowAction> {
     if !review_output.open {
-        return;
+        return None;
     }
 
     let title = match review_output.status {
@@ -1264,6 +1412,9 @@ pub(super) fn render_review_window(
     };
     let mut open = review_output.open;
     let status_line = review_summary_text(review_output);
+    let can_send_follow_up =
+        review_output.status != ReviewStatus::Running && review_output.session_id.is_some();
+    let mut send_follow_up = false;
 
     egui::Window::new(title)
         .id(egui::Id::new((
@@ -1283,16 +1434,75 @@ pub(super) fn render_review_window(
                     review_output.dropped_chars
                 ));
             }
+
+            let composer_reserved_height = if review_output.follow_up_error.is_some() {
+                164.0
+            } else {
+                136.0
+            };
+            let output_max_height =
+                (ui.available_height() - composer_reserved_height).clamp(120.0, 420.0);
+
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
+                .max_height(output_max_height)
                 .stick_to_bottom(review_output.status == ReviewStatus::Running)
                 .show(ui, |scroll| {
                     let content_job = review_output_layout_job(review_output, scroll);
                     scroll.add(egui::Label::new(content_job).extend().selectable(true));
                 });
+
+            ui.separator();
+            ui.add_space(8.0);
+
+            if review_output.session_id.is_none() {
+                ui.small("Unavailable because this review did not expose an session ID.");
+            }
+
+            let draft_is_empty = review_output.follow_up_draft.trim().is_empty();
+            ui.add_enabled_ui(can_send_follow_up, |ui| {
+                let mut enter_pressed = false;
+                let mut send_clicked = false;
+
+                ui.horizontal(|row| {
+                    let send_button_width = 112.0;
+                    let input_width = (row.available_width() - send_button_width - 8.0).max(160.0);
+                    let response = row.add_sized(
+                        [input_width, 0.0],
+                        egui::TextEdit::singleline(&mut review_output.follow_up_draft)
+                            .hint_text("Ask a follow-up"),
+                    );
+                    if response.changed() {
+                        review_output.follow_up_error = None;
+                    }
+
+                    enter_pressed = response.lost_focus()
+                        && row.input(|input| input.key_pressed(egui::Key::Enter));
+                    send_clicked = row
+                        .add_enabled(!draft_is_empty, egui::Button::new("Send message"))
+                        .clicked();
+                });
+
+                if send_clicked || (enter_pressed && !draft_is_empty) {
+                    send_follow_up = true;
+                }
+            });
+
+            if let Some(error) = &review_output.follow_up_error {
+                ui.add_space(8.0);
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
         });
 
     review_output.open = open;
+
+    if send_follow_up {
+        Some(ReviewWindowAction::SendFollowUp {
+            thread_id: review_output.thread_id.clone(),
+        })
+    } else {
+        None
+    }
 }
 
 pub(super) fn custom_review_available_for_repo(
@@ -1352,7 +1562,8 @@ mod tests {
 
     use super::{
         ReviewCommandCapture, ReviewLaunchPlan, ansi_color_from_4bit, append_review_chunk,
-        format_review_incomplete_output, initial_review_output_state, render_review_json_event,
+        append_review_follow_up_prompt, format_review_incomplete_output,
+        initial_review_output_state, render_review_json_event, review_event_session_id,
         review_output_plain_text, strip_ansi_escape_codes,
     };
 
@@ -1494,6 +1705,29 @@ mod tests {
             Some("[task] Explore repo\ntask_id: child-session\n\n")
         );
         assert!(!capture.saw_text_response);
+    }
+
+    #[test]
+    fn review_event_session_id_reads_top_level_value() {
+        let event = json!({
+            "type": "step_start",
+            "sessionID": "ses_top_level",
+            "part": {
+                "sessionID": "ses_nested"
+            }
+        });
+
+        assert_eq!(review_event_session_id(&event), Some("ses_top_level"));
+    }
+
+    #[test]
+    fn append_review_follow_up_prompt_adds_visible_separator() {
+        let mut review_output = review_state();
+
+        append_review_follow_up_prompt(&mut review_output, "Explain the main blocker");
+
+        assert!(review_output_plain_text(&review_output).contains("[Follow-up]"));
+        assert!(review_output_plain_text(&review_output).contains("Explain the main blocker"));
     }
 
     #[test]
