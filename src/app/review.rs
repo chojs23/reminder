@@ -19,6 +19,7 @@ use eframe::egui::{
     self, Color32, Context, FontId, Stroke,
     text::{LayoutJob, TextFormat},
 };
+use serde_json::Value;
 use vt100::Parser as TerminalParser;
 
 #[cfg(test)]
@@ -118,7 +119,13 @@ pub(super) struct ReviewJob {
 
 enum ReviewRunOutcome {
     Completed,
-    Cancelled(String),
+    Cancelled { message: String },
+}
+
+#[derive(Default)]
+struct ReviewCommandCapture {
+    output: String,
+    saw_text_response: bool,
 }
 
 enum ReviewShellDestination {
@@ -215,6 +222,23 @@ fn send_review_bytes(
         thread_id: thread_id.to_owned(),
         bytes: bytes.into(),
     });
+}
+
+fn append_rendered_review_output(
+    capture: &mut ReviewCommandCapture,
+    shell_mirror: &Arc<Mutex<Option<ReviewShellMirror>>>,
+    tx: &mpsc::Sender<ReviewJobMessage>,
+    thread_id: &str,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    capture.output.push_str(text);
+    let bytes = text.as_bytes();
+    mirror_review_chunk(shell_mirror, tx, thread_id, bytes);
+    send_review_bytes(tx, thread_id, bytes.to_vec());
 }
 
 fn mirror_review_chunk(
@@ -316,6 +340,55 @@ fn strip_ansi_escape_codes(text: &str) -> String {
     }
 
     cleaned
+}
+
+fn review_json_string_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str()
+}
+
+fn format_review_tool_event(part: &Value) -> Option<String> {
+    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    let title = review_json_string_at(part, &["state", "title"])
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let output = review_json_string_at(part, &["state", "output"])
+        .map(str::trim)
+        .filter(|output| !output.is_empty());
+
+    match (title, output) {
+        (Some(title), Some(output)) => Some(format!("[{tool}] {title}\n{output}\n\n")),
+        (Some(title), None) => Some(format!("[{tool}] {title}\n\n")),
+        (None, Some(output)) => Some(format!("[{tool}]\n{output}\n\n")),
+        (None, None) => None,
+    }
+}
+
+fn render_review_json_event(event: &Value, capture: &mut ReviewCommandCapture) -> Option<String> {
+    let event_type = event.get("type")?.as_str()?;
+
+    match event_type {
+        "text" => {
+            let text = review_json_string_at(event, &["part", "text"])?;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            capture.saw_text_response = true;
+            Some(format!("{trimmed}\n\n"))
+        }
+        "tool_use" => event.get("part").and_then(format_review_tool_event),
+        "error" => {
+            let message = review_json_string_at(event, &["error", "data", "message"])
+                .or_else(|| review_json_string_at(event, &["error", "message"]))
+                .or_else(|| review_json_string_at(event, &["error", "name"]))?;
+            Some(format!("[Error] {}\n\n", message.trim()))
+        }
+        _ => None,
+    }
 }
 
 fn new_review_terminal() -> TerminalParser {
@@ -657,11 +730,13 @@ impl ReviewJob {
                     thread_id: worker_thread_id.clone(),
                     captured_at: Utc::now(),
                 },
-                Ok(ReviewRunOutcome::Cancelled(message)) => ReviewJobMessage::FinishedCancelled {
-                    thread_id: worker_thread_id.clone(),
-                    captured_at: Utc::now(),
-                    _message: message,
-                },
+                Ok(ReviewRunOutcome::Cancelled { message }) => {
+                    ReviewJobMessage::FinishedCancelled {
+                        thread_id: worker_thread_id.clone(),
+                        captured_at: Utc::now(),
+                        _message: message,
+                    }
+                }
                 Err(message) => ReviewJobMessage::FinishedFailure {
                     thread_id: worker_thread_id,
                     captured_at: Utc::now(),
@@ -806,6 +881,8 @@ fn run_custom_review(
     command.arg("run");
     command.arg("--dir");
     command.arg(repo_path);
+    command.arg("--format");
+    command.arg("json");
     command.arg("--command");
     command.arg(CUSTOM_REVIEW_COMMAND_NAME);
     command.arg(pr_number.to_string());
@@ -849,6 +926,59 @@ fn read_review_stream(
         mirror_review_chunk(shell_mirror, tx, thread_id, chunk);
         send_review_bytes(tx, thread_id, chunk.to_vec());
         capture.push_str(&strip_ansi_escape_codes(&String::from_utf8_lossy(chunk)));
+    }
+
+    Ok(capture)
+}
+
+fn read_review_json_stream(
+    tx: &mpsc::Sender<ReviewJobMessage>,
+    thread_id: &str,
+    reader: impl Read,
+    shell_mirror: &Arc<Mutex<Option<ReviewShellMirror>>>,
+    cancel_requested: &Arc<AtomicBool>,
+    stream_label: &str,
+) -> Result<ReviewCommandCapture, String> {
+    let mut capture = ReviewCommandCapture::default();
+    let mut reader = BufReader::new(reader);
+    let mut buffer = [0_u8; 4096];
+    let mut pending = String::new();
+
+    loop {
+        let bytes = match reader.read(&mut buffer) {
+            Ok(bytes) => bytes,
+            Err(_err) if cancel_requested.load(Ordering::SeqCst) => break,
+            Err(err) => return Err(format!("Failed to read {stream_label}: {err}")),
+        };
+
+        if bytes == 0 {
+            break;
+        }
+
+        pending.push_str(&String::from_utf8_lossy(&buffer[..bytes]));
+
+        while let Some(newline_index) = pending.find('\n') {
+            let line: String = pending.drain(..=newline_index).collect();
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let rendered = serde_json::from_str::<Value>(trimmed)
+                .ok()
+                .and_then(|event| render_review_json_event(&event, &mut capture))
+                .unwrap_or_else(|| format!("{trimmed}\n"));
+            append_rendered_review_output(&mut capture, shell_mirror, tx, thread_id, &rendered);
+        }
+    }
+
+    let trailing = pending.trim();
+    if !trailing.is_empty() {
+        let rendered = serde_json::from_str::<Value>(trailing)
+            .ok()
+            .and_then(|event| render_review_json_event(&event, &mut capture))
+            .unwrap_or_else(|| format!("{trailing}\n"));
+        append_rendered_review_output(&mut capture, shell_mirror, tx, thread_id, &rendered);
     }
 
     Ok(capture)
@@ -919,7 +1049,9 @@ fn stream_review_command(
                                 )
                             })?
                             .is_some() => {}
-                Err(err) => return Err(format!("Failed to stop review: {err}")),
+                Err(err) => {
+                    return Err(format!("Failed to stop review: {err}"));
+                }
             }
         }
     }
@@ -939,7 +1071,7 @@ fn stream_review_command(
         )
     });
 
-    let stdout_capture = read_review_stream(
+    let stdout_capture = read_review_json_stream(
         tx,
         thread_id,
         stdout,
@@ -958,11 +1090,13 @@ fn stream_review_command(
         match child.wait() {
             Ok(status) => status,
             Err(err) if cancel_requested.load(Ordering::SeqCst) => {
-                return Ok(ReviewRunOutcome::Cancelled(
-                    "Review canceled by user.".to_owned(),
-                ));
+                return Ok(ReviewRunOutcome::Cancelled {
+                    message: "Review canceled by user.".to_owned(),
+                });
             }
-            Err(err) => return Err(format!("Failed while waiting for review: {err}")),
+            Err(err) => {
+                return Err(format!("Failed while waiting for review: {err}"));
+            }
         }
     };
     let stderr_capture = match stderr_handle.join() {
@@ -985,12 +1119,19 @@ fn stream_review_command(
 
     if cancel_requested.load(Ordering::SeqCst) && !status.success() {
         finish_review_shell_stream(&shell_mirror, tx, thread_id, "cancelled");
-        return Ok(ReviewRunOutcome::Cancelled(
-            "Review canceled by user.".to_owned(),
-        ));
+        return Ok(ReviewRunOutcome::Cancelled {
+            message: "Review canceled by user.".to_owned(),
+        });
     }
 
     if status.success() {
+        if !stdout_capture.saw_text_response {
+            finish_review_shell_stream(&shell_mirror, tx, thread_id, "incomplete");
+            return Err(format_review_incomplete_output(
+                &stdout_capture.output,
+                &stderr_capture,
+            ));
+        }
         finish_review_shell_stream(&shell_mirror, tx, thread_id, "completed");
         return Ok(ReviewRunOutcome::Completed);
     }
@@ -999,9 +1140,24 @@ fn stream_review_command(
 
     Err(format_review_failure_output(
         &status.to_string(),
-        &stdout_capture,
+        &stdout_capture.output,
         &stderr_capture,
     ))
+}
+
+fn format_review_incomplete_output(stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    let guidance = "opencode review exited before producing a final assistant response. This usually means the review ended early or handed work off without returning a final result.";
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => guidance.to_owned(),
+        (false, true) => format!("{guidance}\n\nCaptured output:\n{stdout}"),
+        (true, false) => format!("{guidance}\n\nDiagnostics:\n{stderr}"),
+        (false, false) => {
+            format!("{guidance}\n\nCaptured output:\n{stdout}\n\nDiagnostics:\n{stderr}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1192,9 +1348,11 @@ fn custom_review_command_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::domain::ReviewCommandSettings;
+    use serde_json::json;
 
     use super::{
-        ReviewLaunchPlan, ansi_color_from_4bit, append_review_chunk, initial_review_output_state,
+        ReviewCommandCapture, ReviewLaunchPlan, ansi_color_from_4bit, append_review_chunk,
+        format_review_incomplete_output, initial_review_output_state, render_review_json_event,
         review_output_plain_text, strip_ansi_escape_codes,
     };
 
@@ -1297,5 +1455,52 @@ mod tests {
         append_review_chunk(&mut review_output, "temporary status\r\u{1b}[2Kreal output");
 
         assert_eq!(review_output_plain_text(&review_output), "real output");
+    }
+
+    #[test]
+    fn render_review_json_event_marks_text_response_as_ready_signal() {
+        let mut capture = ReviewCommandCapture::default();
+        let event = json!({
+            "type": "text",
+            "part": {
+                "text": "Review posted successfully"
+            }
+        });
+
+        let rendered = render_review_json_event(&event, &mut capture);
+
+        assert_eq!(rendered.as_deref(), Some("Review posted successfully\n\n"));
+        assert!(capture.saw_text_response);
+    }
+
+    #[test]
+    fn render_review_json_event_formats_tool_output_without_ready_signal() {
+        let mut capture = ReviewCommandCapture::default();
+        let event = json!({
+            "type": "tool_use",
+            "part": {
+                "tool": "task",
+                "state": {
+                    "title": "Explore repo",
+                    "output": "task_id: child-session"
+                }
+            }
+        });
+
+        let rendered = render_review_json_event(&event, &mut capture);
+
+        assert_eq!(
+            rendered.as_deref(),
+            Some("[task] Explore repo\ntask_id: child-session\n\n")
+        );
+        assert!(!capture.saw_text_response);
+    }
+
+    #[test]
+    fn format_review_incomplete_output_explains_missing_final_response() {
+        let message = format_review_incomplete_output("[task] spawned child", "");
+
+        assert!(message.contains("exited before producing a final assistant response"));
+        assert!(message.contains("[task] spawned child"));
     }
 }
