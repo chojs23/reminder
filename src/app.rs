@@ -1,6 +1,7 @@
 mod fonts;
 mod notification_state;
 mod repo_paths;
+mod repo_state;
 mod review;
 mod scheduler;
 mod search;
@@ -17,13 +18,21 @@ use eframe::{
 
 use self::{
     fonts::install_international_fonts,
-    repo_paths::{canonical_repo_key, normalize_hydrated_repo_paths},
-    review::{ReviewWindowAction, custom_review_command_available, render_review_window},
+    repo_paths::{
+        canonical_repo_key, normalize_hydrated_repo_path_accounts, normalize_hydrated_repo_paths,
+    },
+    repo_state::RepoState,
+    review::{
+        ReviewWindowAction, custom_review_command_available,
+        default_pr_description_prompt_md_path_display, default_review_prompt_md_path_display,
+        render_review_window, review_prompt_command_available,
+    },
     scheduler::BatchRefreshScheduler,
     state::AccountState,
     ui::{
-        account_overview, render_account_card, render_tracked_account_badges,
-        responsive_accounts_panel_width, tracked_account_heading, uses_compact_account_rows,
+        account_overview, render_account_card, render_repository_card,
+        render_tracked_account_badges, responsive_accounts_panel_width, tracked_account_heading,
+        uses_compact_account_rows,
     },
 };
 
@@ -42,6 +51,7 @@ const COMPACT_ACCOUNT_ROW_WIDTH: f32 = 180.0;
 const STACKED_ACCOUNT_HEADER_WIDTH: f32 = 620.0;
 const COMPACT_NOTIFICATION_WIDTH: f32 = 640.0;
 const CUSTOM_REVIEW_COMMAND_NAME: &str = "review-pr";
+const CUSTOM_PR_DESCRIPTION_COMMAND_NAME: &str = "pr-description";
 #[cfg(test)]
 const MAX_REVIEW_OUTPUT_CHARS: usize = 20_000;
 const ACTIVE_REVIEW_REPAINT_MS: u64 = 50;
@@ -79,9 +89,15 @@ pub struct ReminderApp {
     repo_path_form: RepoPathForm,
     account_delete_confirmation: Option<AccountDeleteConfirmation>,
     review_settings_editor: Option<AccountReviewSettingsEditor>,
+    repo_path_account_editor: Option<RepoPathAccountEditor>,
     accounts: Vec<AccountState>,
     repo_paths: BTreeMap<String, String>,
+    repo_path_accounts: BTreeMap<String, String>,
+    repo_views: BTreeMap<String, RepoState>,
     selected_account_login: Option<String>,
+    selected_repo: Option<String>,
+    repo_path_filter_login: Option<String>,
+    show_all_accounts: bool,
     secret_store: Option<AccountStore>,
     storage_warning: Option<String>,
     global_error: Option<String>,
@@ -97,9 +113,15 @@ impl ReminderApp {
             repo_path_form: RepoPathForm::default(),
             account_delete_confirmation: None,
             review_settings_editor: None,
+            repo_path_account_editor: None,
             accounts: Vec::new(),
             repo_paths: BTreeMap::new(),
+            repo_path_accounts: BTreeMap::new(),
+            repo_views: BTreeMap::new(),
             selected_account_login: None,
+            selected_repo: None,
+            repo_path_filter_login: None,
+            show_all_accounts: true,
             secret_store: None,
             storage_warning: None,
             global_error: None,
@@ -120,9 +142,22 @@ impl ReminderApp {
                         let (repo_paths, dropped_repo_paths) =
                             normalize_hydrated_repo_paths(outcome.repo_paths);
                         app.repo_paths = repo_paths;
-                        if dropped_repo_paths > 0 {
+                        let account_logins: Vec<_> = app
+                            .accounts
+                            .iter()
+                            .map(|account| account.profile.login.clone())
+                            .collect();
+                        let (repo_path_accounts, dropped_repo_path_accounts) =
+                            normalize_hydrated_repo_path_accounts(
+                                outcome.repo_path_accounts,
+                                &app.repo_paths,
+                                &account_logins,
+                            );
+                        app.repo_path_accounts = repo_path_accounts;
+                        if dropped_repo_paths > 0 || dropped_repo_path_accounts > 0 {
                             app.storage_warning = Some(format!(
-                                "Skipped {dropped_repo_paths} invalid local repo path mapping(s) while restoring settings."
+                                "Skipped {} invalid local repo path setting(s) while restoring settings.",
+                                dropped_repo_paths + dropped_repo_path_accounts
                             ));
                         }
                     }
@@ -199,11 +234,27 @@ impl ReminderApp {
         }
 
         let login = self.accounts[idx].profile.login.clone();
+        let linked_repos: Vec<_> = self
+            .repo_path_accounts
+            .iter()
+            .filter(|(_, linked_login)| *linked_login == &login)
+            .map(|(repo, _)| repo.clone())
+            .collect();
         if let Some(store) = &self.secret_store
             && let Err(err) = store.forget(&login)
         {
             self.global_error = Some(format!("Failed to remove credentials for {login}: {err}"));
             return;
+        }
+        if let Some(store) = &self.secret_store {
+            for repo in &linked_repos {
+                if let Err(err) = store.clear_repo_path_account(repo) {
+                    self.global_error = Some(format!(
+                        "Failed to clear repo path account for {repo}: {err}"
+                    ));
+                    return;
+                }
+            }
         }
 
         if self
@@ -220,8 +271,21 @@ impl ReminderApp {
         {
             self.account_delete_confirmation = None;
         }
+        if self
+            .repo_path_account_editor
+            .as_ref()
+            .is_some_and(|editor| editor.repo_login == login)
+        {
+            self.repo_path_account_editor = None;
+        }
 
         self.accounts.remove(idx);
+        for repo in linked_repos {
+            self.repo_path_accounts.remove(&repo);
+        }
+        if self.repo_path_filter_login.as_deref() == Some(login.as_str()) {
+            self.repo_path_filter_login = None;
+        }
         self.ensure_selected_account();
     }
 
@@ -230,6 +294,66 @@ impl ReminderApp {
             login: login.to_owned(),
             typed_login: String::new(),
         });
+    }
+
+    fn open_repo_path_account_editor(&mut self, repo: &str) {
+        if !self.repo_paths.contains_key(repo) {
+            self.global_error = Some(format!("Cannot find repo path for {repo}."));
+            return;
+        }
+
+        self.repo_path_account_editor = Some(RepoPathAccountEditor {
+            repo: repo.to_owned(),
+            repo_login: self
+                .repo_path_accounts
+                .get(repo)
+                .cloned()
+                .unwrap_or_default(),
+            form_error: None,
+        });
+    }
+
+    fn assign_repo_path_account(&mut self, repo: &str, login: &str) {
+        if !self.repo_paths.contains_key(repo) {
+            self.global_error = Some(format!("Cannot find repo path for {repo}."));
+            return;
+        }
+        let Some(account_login) = self
+            .accounts
+            .iter()
+            .find(|account| account.profile.login == login)
+            .map(|account| account.profile.login.clone())
+        else {
+            if let Some(editor) = &mut self.repo_path_account_editor {
+                editor.form_error = Some(format!("Cannot find tracked account {login}."));
+            }
+            return;
+        };
+
+        if let Some(store) = &self.secret_store {
+            if let Err(err) = store.persist_repo_path_account(repo, &account_login) {
+                if let Some(editor) = &mut self.repo_path_account_editor {
+                    editor.form_error = Some(format!("Unable to update repo path account: {err}"));
+                }
+                return;
+            }
+        } else if let Some(editor) = &mut self.repo_path_account_editor {
+            editor.form_error = Some(
+                "Local storage is not available; cannot update repo path accounts right now."
+                    .to_owned(),
+            );
+            return;
+        }
+
+        self.repo_path_accounts
+            .insert(repo.to_owned(), account_login.clone());
+        self.repo_path_account_editor = None;
+
+        if self.selected_repo.as_deref() == Some(repo) {
+            self.selected_account_login = Some(account_login.clone());
+            let repo = repo.to_owned();
+            self.select_repo(repo);
+        }
     }
 
     fn confirm_account_delete_matches(expected_login: &str, typed_login: &str) -> bool {
@@ -277,15 +401,22 @@ impl ReminderApp {
             return;
         }
 
-        if !canonical_path.join(".git").exists() {
+        let canonical_path = canonical_path.display().to_string();
+        let linked_login = self.selected_account_login.clone().or_else(|| {
+            self.accounts
+                .first()
+                .map(|account| account.profile.login.clone())
+        });
+        if linked_login.is_none() {
             self.repo_path_form.form_error =
-                Some("Local checkout path must point to a git repository.".to_owned());
+                Some("Add at least one tracked account before saving a repo path.".to_owned());
             return;
         }
 
-        let canonical_path = canonical_path.display().to_string();
         if let Some(store) = &self.secret_store {
-            if let Err(err) = store.persist_repo_path(&repo, &canonical_path) {
+            if let Err(err) =
+                store.persist_repo_path(&repo, &canonical_path, linked_login.as_deref())
+            {
                 self.repo_path_form.form_error =
                     Some(format!("Unable to persist local repo path: {err}"));
                 return;
@@ -297,7 +428,10 @@ impl ReminderApp {
             return;
         }
 
-        self.repo_paths.insert(repo, canonical_path);
+        self.repo_paths.insert(repo.clone(), canonical_path);
+        if let Some(login) = linked_login {
+            self.repo_path_accounts.insert(repo, login);
+        }
         self.repo_path_form = RepoPathForm::default();
     }
 
@@ -315,6 +449,18 @@ impl ReminderApp {
             login: account.profile.login.clone(),
             env_vars_text: format_review_env_vars(&account.profile.review_settings),
             additional_args_text: format_review_additional_args(&account.profile.review_settings),
+            review_prompt_md_path_text: account
+                .profile
+                .review_settings
+                .review_prompt_md_path
+                .clone()
+                .unwrap_or_default(),
+            pr_description_md_path_text: account
+                .profile
+                .review_settings
+                .pr_description_md_path
+                .clone()
+                .unwrap_or_default(),
             form_error: None,
         });
     }
@@ -339,6 +485,8 @@ impl ReminderApp {
         let review_settings = ReviewCommandSettings {
             env_vars,
             additional_args,
+            review_prompt_md_path: normalize_optional_path(&editor.review_prompt_md_path_text),
+            pr_description_md_path: normalize_optional_path(&editor.pr_description_md_path_text),
         };
 
         let Some(account_idx) = self
@@ -400,6 +548,20 @@ impl ReminderApp {
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
                         .hint_text("--lang korean"),
+                );
+                ui.add_space(8.0);
+                ui.label("Review prompt md path");
+                ui.add(
+                    egui::TextEdit::singleline(&mut editor.review_prompt_md_path_text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(default_review_prompt_md_path_display()),
+                );
+                ui.add_space(8.0);
+                ui.label("PR Description md path");
+                ui.add(
+                    egui::TextEdit::singleline(&mut editor.pr_description_md_path_text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(default_pr_description_prompt_md_path_display()),
                 );
 
                 if let Some(error) = &editor.form_error {
@@ -479,6 +641,212 @@ impl ReminderApp {
         }
     }
 
+    fn render_repo_path_account_editor_window(&mut self, ctx: &Context) {
+        let Some(editor) = self.repo_path_account_editor.as_mut() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut selected_login = None;
+        let mut cancel_requested = false;
+        let title = format!("Repo path account: {}", editor.repo);
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_size(egui::vec2(360.0, 220.0))
+            .show(ctx, |ui| {
+                ui.label("Choose which tracked account this local repo path depends on.");
+                if editor.repo_login.is_empty() {
+                    ui.small("Current account: unassigned");
+                } else {
+                    ui.small(format!("Current account: {}", editor.repo_login));
+                }
+                ui.add_space(8.0);
+
+                if self.accounts.is_empty() {
+                    ui.weak("No tracked accounts available.");
+                } else {
+                    for account in &self.accounts {
+                        if ui.button(&account.profile.login).clicked() {
+                            selected_login = Some(account.profile.login.clone());
+                        }
+                    }
+                }
+
+                if let Some(error) = &editor.form_error {
+                    ui.add_space(8.0);
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+
+                ui.add_space(12.0);
+                if ui.button("Cancel").clicked() {
+                    cancel_requested = true;
+                }
+            });
+
+        if let Some(login) = selected_login {
+            let repo = editor.repo.clone();
+            self.assign_repo_path_account(&repo, &login);
+        } else if cancel_requested || !open {
+            self.repo_path_account_editor = None;
+        }
+    }
+
+    fn render_review_request_windows(&mut self, ctx: &Context) {
+        for idx in 0..self.accounts.len() {
+            let mut request_login = None;
+            let mut renotify_login = None;
+            let mut remove_login = None;
+            let mut cancel_requested = false;
+
+            {
+                let account = &mut self.accounts[idx];
+                let account_login = account.profile.login.clone();
+                let Some(editor) = account.review_request_editor.as_mut() else {
+                    continue;
+                };
+
+                let mut open = true;
+                let title = format!("Request review: {}#{}", editor.repo, editor.pr_number);
+                let current_reviewers = editor.requested_reviewers.clone();
+                let history_reviewers: Vec<_> = editor
+                    .reviewer_history
+                    .iter()
+                    .filter(|login| {
+                        !current_reviewers
+                            .iter()
+                            .any(|current| current.eq_ignore_ascii_case(login))
+                    })
+                    .cloned()
+                    .collect();
+                let busy = editor.pending_load || editor.pending_action;
+
+                egui::Window::new(title)
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_size(egui::vec2(520.0, 360.0))
+                    .show(ctx, |ui| {
+                        ui.label(format!("Account: {account_login}"));
+                        ui.small(editor.pr_title.as_str());
+                        ui.add_space(8.0);
+
+                        ui.label("Reviewer");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.reviewer_login)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("octocat"),
+                        );
+
+                        if editor.pending_load {
+                            ui.add_space(8.0);
+                            ui.label("Loading reviewers...");
+                        } else if editor.pending_action {
+                            ui.add_space(8.0);
+                            ui.label("Updating reviewers...");
+                        }
+
+                        if let Some(message) = &editor.status_message {
+                            ui.add_space(8.0);
+                            ui.colored_label(ui.visuals().hyperlink_color, message);
+                        }
+                        if let Some(error) = &editor.form_error {
+                            ui.add_space(8.0);
+                            ui.colored_label(ui.visuals().error_fg_color, error);
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.label("Current reviewers");
+                        if current_reviewers.is_empty() {
+                            ui.weak("No active review requests.");
+                        } else {
+                            ui.horizontal_wrapped(|row| {
+                                for login in &current_reviewers {
+                                    if row.small_button(login).clicked() {
+                                        editor.reviewer_login = login.clone();
+                                    }
+                                    if row
+                                        .add_enabled(!busy, egui::Button::new("🗑"))
+                                        .on_hover_text("Remove this reviewer request.")
+                                        .clicked()
+                                    {
+                                        remove_login = Some(login.clone());
+                                    }
+                                }
+                            });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.label("History");
+                        if history_reviewers.is_empty() {
+                            ui.weak("No previous reviewers yet.");
+                        } else {
+                            ui.horizontal_wrapped(|row| {
+                                for login in &history_reviewers {
+                                    if row.small_button(login).clicked() {
+                                        editor.reviewer_login = login.clone();
+                                    }
+                                    if row
+                                        .add_enabled(!busy, egui::Button::new("+"))
+                                        .on_hover_text("Request review from this reviewer again.")
+                                        .clicked()
+                                    {
+                                        request_login = Some(login.clone());
+                                    }
+                                }
+                            });
+                        }
+
+                        ui.add_space(12.0);
+                        let reviewer_login = editor.reviewer_login.trim().to_owned();
+                        let has_reviewer_login = !reviewer_login.is_empty();
+                        ui.horizontal(|row| {
+                            if row
+                                .add_enabled(
+                                    has_reviewer_login && !busy,
+                                    egui::Button::new("Request"),
+                                )
+                                .clicked()
+                            {
+                                request_login = Some(reviewer_login.clone());
+                            }
+                            if row
+                                .add_enabled(
+                                    has_reviewer_login && !busy,
+                                    egui::Button::new("Re-notify"),
+                                )
+                                .clicked()
+                            {
+                                renotify_login = Some(reviewer_login.clone());
+                            }
+                            if row.button("Cancel").clicked() {
+                                cancel_requested = true;
+                            }
+                        });
+                    });
+
+                if !open {
+                    cancel_requested = true;
+                }
+            }
+
+            let account = &mut self.accounts[idx];
+            if let Some(login) = remove_login {
+                account.remove_pull_request_review(login);
+            } else if let Some(login) = request_login {
+                account.request_pull_request_review(login);
+            } else if let Some(login) = renotify_login {
+                account.renotify_pull_request_review(login);
+            } else if cancel_requested {
+                account.close_review_request_editor();
+            }
+        }
+    }
+
     fn remove_repo_path(&mut self, repo: &str) {
         if let Some(store) = &self.secret_store
             && let Err(err) = store.forget_repo_path(repo)
@@ -488,6 +856,18 @@ impl ReminderApp {
         }
 
         self.repo_paths.remove(repo);
+        self.repo_path_accounts.remove(repo);
+        self.repo_views.remove(repo);
+        if self.selected_repo.as_deref() == Some(repo) {
+            self.selected_repo = None;
+        }
+        if self
+            .repo_path_account_editor
+            .as_ref()
+            .is_some_and(|editor| editor.repo == repo)
+        {
+            self.repo_path_account_editor = None;
+        }
     }
 
     fn ensure_selected_account(&mut self) {
@@ -513,11 +893,27 @@ impl ReminderApp {
             .map(|account| account.profile.login.clone());
     }
 
+    fn ensure_selected_repo(&mut self) {
+        let Some(selected_repo) = self.selected_repo.as_deref() else {
+            return;
+        };
+
+        if self.repo_paths.contains_key(selected_repo) {
+            return;
+        }
+
+        self.selected_repo = None;
+    }
+
     fn poll_jobs(&mut self) {
         for account in &mut self.accounts {
             account.poll_job();
             account.poll_action_jobs();
             account.poll_review_job();
+            account.poll_review_request_jobs();
+        }
+        for repo_view in self.repo_views.values_mut() {
+            repo_view.poll_job();
         }
     }
 
@@ -547,6 +943,73 @@ impl ReminderApp {
 
         if triggered {
             self.auto_refresh.mark_triggered();
+        }
+
+        let Some(selected_repo) = self.selected_repo.clone() else {
+            return;
+        };
+        let Some(selected_idx) = self.selected_account_index() else {
+            return;
+        };
+
+        let profile = self.accounts[selected_idx].profile.clone();
+        let repo_view = self
+            .repo_views
+            .entry(selected_repo.clone())
+            .or_insert_with(|| RepoState::new(selected_repo));
+        if repo_view.should_refresh_with(
+            &profile.login,
+            Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS),
+        ) {
+            repo_view.start_refresh(profile);
+            self.auto_refresh.mark_triggered();
+        }
+    }
+
+    fn select_account(&mut self, login: String) {
+        self.selected_account_login = Some(login);
+        self.selected_repo = None;
+        self.repo_path_filter_login = self.selected_account_login.clone();
+        self.show_all_accounts = false;
+    }
+
+    fn show_all_repo_paths(&mut self) {
+        self.repo_path_filter_login = None;
+        self.selected_repo = None;
+        self.show_all_accounts = true;
+    }
+
+    fn select_repo(&mut self, repo: String) {
+        if !self.repo_paths.contains_key(&repo) {
+            return;
+        }
+
+        if let Some(linked_login) = self.repo_path_accounts.get(&repo)
+            && self
+                .accounts
+                .iter()
+                .any(|account| account.profile.login == *linked_login)
+        {
+            self.selected_account_login = Some(linked_login.clone());
+        }
+
+        self.selected_repo = Some(repo.clone());
+        self.show_all_accounts = false;
+        self.ensure_selected_account();
+        let Some(selected_idx) = self.selected_account_index() else {
+            return;
+        };
+
+        let profile = self.accounts[selected_idx].profile.clone();
+        let repo_view = self
+            .repo_views
+            .entry(repo.clone())
+            .or_insert_with(|| RepoState::new(repo));
+        if repo_view.should_refresh_with(
+            &profile.login,
+            Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS),
+        ) {
+            repo_view.start_refresh(profile);
         }
     }
 
@@ -583,7 +1046,13 @@ impl ReminderApp {
         }
 
         ui.separator();
-        ui.label("Tracked accounts");
+        ui.horizontal(|row| {
+            row.label("Tracked accounts");
+            let showing_all = self.repo_path_filter_login.is_none();
+            if row.selectable_label(showing_all, "All").clicked() {
+                self.show_all_repo_paths();
+            }
+        });
         if self.accounts.is_empty() {
             ui.weak("No accounts yet.");
         } else {
@@ -597,7 +1066,7 @@ impl ReminderApp {
                 let pending = account.pending_job.is_some();
                 let has_error = account.last_error.is_some();
                 let is_selected =
-                    self.selected_account_login.as_deref() == Some(account.profile.login.as_str());
+                    self.repo_path_filter_login.as_deref() == Some(account.profile.login.as_str());
                 let heading = tracked_account_heading(ui, account, is_selected, overview);
 
                 ui.group(|group| {
@@ -635,7 +1104,7 @@ impl ReminderApp {
                 });
             }
             if let Some(login) = selected_login {
-                self.selected_account_login = Some(login);
+                self.select_account(login);
             }
             if let Some(login) = settings_login {
                 self.open_review_settings_editor(&login);
@@ -655,10 +1124,12 @@ impl ReminderApp {
         ui.label("Local repo paths");
         if custom_review_command_available() {
             ui.small(
-                "Mapped repos can use your custom `review-pr` opencode command. Unmapped repos cannot be reviewed.",
+                "Mapped repos can use your custom `review-pr` opencode command. You can override the prompt path per account in Settings.",
             );
         } else {
-            ui.small("No custom `review-pr` command detected. Reviews are unavailable.");
+            ui.small(
+                "No default custom `review-pr` command detected. You can still set an override path per account in Settings.",
+            );
         }
         ui.label("Repository (owner/repo)");
         ui.text_edit_singleline(&mut self.repo_path_form.repo);
@@ -682,14 +1153,87 @@ impl ReminderApp {
             ui.weak("No local repos configured yet.");
         } else {
             let mut remove_repo = None;
-            for (repo, path) in &self.repo_paths {
+            let mut selected_repo = None;
+            let mut edit_repo = None;
+            let visible_repos: Vec<_> = self
+                .repo_paths
+                .iter()
+                .filter(|(repo, _)| {
+                    self.repo_path_filter_login
+                        .as_ref()
+                        .is_none_or(|filter_login| {
+                            self.repo_path_accounts.get(*repo) == Some(filter_login)
+                        })
+                })
+                .collect();
+            if visible_repos.is_empty() {
+                if let Some(filter_login) = self.repo_path_filter_login.as_deref() {
+                    ui.weak(format!("No local repos linked to {filter_login}."));
+                } else {
+                    ui.weak("No local repos configured yet.");
+                }
+            }
+            for (repo, path) in visible_repos {
+                let repo_state = self.repo_views.get(repo);
+                let open_count = repo_state
+                    .and_then(|repo_state| repo_state.snapshot.as_ref())
+                    .map(|snapshot| snapshot.pull_requests.len());
+                let pending = repo_state.is_some_and(|repo_state| repo_state.pending_job.is_some());
+                let has_error =
+                    repo_state.is_some_and(|repo_state| repo_state.last_error.is_some());
+                let is_selected = self.selected_repo.as_deref() == Some(repo.as_str());
+                let linked_login = self.repo_path_accounts.get(repo);
                 ui.group(|group| {
-                    group.label(repo);
-                    group.small(path);
-                    if group.small_button("Remove path").clicked() {
-                        remove_repo = Some(repo.clone());
+                    if group.selectable_label(is_selected, repo).clicked() {
+                        selected_repo = Some(repo.clone());
                     }
+                    group.small(path);
+                    if let Some(linked_login) = linked_login {
+                        group.small(format!("Tracked account: {linked_login}"));
+                    } else {
+                        group.small(
+                            egui::RichText::new("Tracked account: unassigned")
+                                .color(group.visuals().weak_text_color()),
+                        );
+                    }
+                    group.horizontal_wrapped(|row| {
+                        if let Some(open_count) = open_count {
+                            row.small(format!("open {open_count}"));
+                        } else if pending {
+                            row.small(
+                                egui::RichText::new("Loading…")
+                                    .color(row.visuals().weak_text_color()),
+                            );
+                        } else {
+                            row.small(
+                                egui::RichText::new("No data yet")
+                                    .color(row.visuals().weak_text_color()),
+                            );
+                        }
+                        if has_error {
+                            row.small(
+                                egui::RichText::new("sync failed")
+                                    .color(row.visuals().error_fg_color),
+                            );
+                        }
+                    });
+                    group.horizontal(|row| {
+                        row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |row| {
+                            if row.small_button("✏").clicked() {
+                                edit_repo = Some(repo.clone());
+                            }
+                            if row.small_button("Remove path").clicked() {
+                                remove_repo = Some(repo.clone());
+                            }
+                        });
+                    });
                 });
+            }
+            if let Some(repo) = selected_repo {
+                self.select_repo(repo);
+            }
+            if let Some(repo) = edit_repo {
+                self.open_repo_path_account_editor(&repo);
             }
             if let Some(repo) = remove_repo {
                 self.remove_repo_path(&repo);
@@ -699,6 +1243,86 @@ impl ReminderApp {
 
     fn render_dashboard(&mut self, ui: &mut egui::Ui) {
         self.render_global_error(ui);
+
+        if let Some(selected_repo) = self.selected_repo.clone() {
+            if self.accounts.is_empty() {
+                ui.centered_and_justified(|center| {
+                    center
+                        .label("Add at least one GitHub account to load repository pull requests.");
+                });
+                return;
+            }
+
+            let Some(selected_idx) = self.selected_account_index() else {
+                ui.centered_and_justified(|center| {
+                    center.label("Select an account on the left to load repository pull requests.");
+                });
+                return;
+            };
+
+            let repo_key = selected_repo.clone();
+            let repo_paths = &self.repo_paths;
+            let account = &mut self.accounts[selected_idx];
+            let custom_review_command =
+                review_prompt_command_available(&account.profile.review_settings);
+            let repo_state = self
+                .repo_views
+                .entry(selected_repo.clone())
+                .or_insert_with(|| RepoState::new(selected_repo));
+
+            egui::ScrollArea::vertical().show(ui, |area| {
+                area.push_id(format!("repo-{repo_key}"), |ui| {
+                    render_repository_card(
+                        ui,
+                        account,
+                        repo_state,
+                        repo_paths,
+                        custom_review_command,
+                    );
+                });
+            });
+            return;
+        }
+
+        if self.show_all_accounts {
+            if self.accounts.is_empty() {
+                ui.centered_and_justified(|center| {
+                    center.label(
+                        "Add at least one GitHub account to start aggregating notifications.",
+                    );
+                });
+                return;
+            }
+
+            egui::ScrollArea::vertical().show(ui, |area| {
+                area.push_id("all-accounts-dashboard", |ui| {
+                    ui.group(|group| {
+                        group.heading("Account: All");
+                        group.small(format!(
+                            "Showing notifications from {} tracked account(s).",
+                            self.accounts.len()
+                        ));
+                    });
+                    ui.add_space(12.0);
+
+                    for account in &mut self.accounts {
+                        account.clear_new_notifications();
+                        let account_id = account.profile.login.clone();
+                        let custom_review_command =
+                            review_prompt_command_available(&account.profile.review_settings);
+                        ui.push_id(account_id, |ui| {
+                            render_account_card(
+                                ui,
+                                account,
+                                &self.repo_paths,
+                                custom_review_command,
+                            );
+                        });
+                    }
+                });
+            });
+            return;
+        }
 
         if self.accounts.is_empty() {
             ui.centered_and_justified(|center| {
@@ -725,7 +1349,8 @@ impl ReminderApp {
             let account = &mut self.accounts[selected_idx];
             account.clear_new_notifications();
             let account_id = account.profile.login.clone();
-            let custom_review_command = custom_review_command_available();
+            let custom_review_command =
+                review_prompt_command_available(&account.profile.review_settings);
             area.push_id(account_id, |ui| {
                 render_account_card(ui, account, &self.repo_paths, custom_review_command);
             });
@@ -743,14 +1368,17 @@ impl ReminderApp {
 impl App for ReminderApp {
     fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
         self.poll_jobs();
-        self.maybe_auto_refresh();
         self.ensure_selected_account();
+        self.ensure_selected_repo();
+        self.maybe_auto_refresh();
 
         let accounts_panel_width = responsive_accounts_panel_width(ctx.available_rect().width());
 
         egui::SidePanel::left("accounts_panel")
             .exact_width(accounts_panel_width)
-            .show(ctx, |ui| self.render_side_panel(ui));
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.render_side_panel(ui));
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_dashboard(ui);
@@ -758,6 +1386,8 @@ impl App for ReminderApp {
 
         self.render_account_delete_confirmation_window(ctx);
         self.render_review_settings_window(ctx);
+        self.render_repo_path_account_editor_window(ctx);
+        self.render_review_request_windows(ctx);
 
         for account in &mut self.accounts {
             let mut review_window_actions = Vec::new();
@@ -800,6 +1430,17 @@ enum AccountAction {
         pr_number: u64,
         pr_url: String,
     },
+    PrDescription {
+        thread_id: String,
+        repo: String,
+        pr_number: u64,
+        pr_url: String,
+    },
+    OpenReviewRequest {
+        repo: String,
+        pr_number: u64,
+        pr_title: String,
+    },
     StopReview(String),
     ToggleReviewWindow(String),
     Seen(String),
@@ -834,10 +1475,31 @@ struct RepoPathForm {
     form_error: Option<String>,
 }
 
+struct ReviewRequestEditor {
+    repo: String,
+    pr_number: u64,
+    pr_title: String,
+    reviewer_login: String,
+    requested_reviewers: Vec<String>,
+    reviewer_history: Vec<String>,
+    pending_load: bool,
+    pending_action: bool,
+    form_error: Option<String>,
+    status_message: Option<String>,
+}
+
 struct AccountReviewSettingsEditor {
     login: String,
     env_vars_text: String,
     additional_args_text: String,
+    review_prompt_md_path_text: String,
+    pr_description_md_path_text: String,
+    form_error: Option<String>,
+}
+
+struct RepoPathAccountEditor {
+    repo: String,
+    repo_login: String,
     form_error: Option<String>,
 }
 
@@ -857,6 +1519,11 @@ fn format_review_env_vars(settings: &ReviewCommandSettings) -> String {
 
 fn format_review_additional_args(settings: &ReviewCommandSettings) -> String {
     settings.additional_args.join(" ")
+}
+
+fn normalize_optional_path(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn parse_review_env_vars(text: &str) -> Result<BTreeMap<String, String>, String> {
@@ -1022,9 +1689,15 @@ mod tests {
             repo_path_form: RepoPathForm::default(),
             account_delete_confirmation: None,
             review_settings_editor: None,
+            repo_path_account_editor: None,
             accounts: logins.iter().map(|login| make_account(login)).collect(),
             repo_paths: BTreeMap::new(),
+            repo_path_accounts: BTreeMap::new(),
+            repo_views: BTreeMap::new(),
             selected_account_login: None,
+            selected_repo: None,
+            repo_path_filter_login: None,
+            show_all_accounts: true,
             secret_store: None,
             storage_warning: None,
             global_error: None,
@@ -1117,6 +1790,58 @@ mod tests {
     }
 
     #[test]
+    fn ensure_selected_repo_clears_missing_repo() {
+        let mut app = app_with_accounts(&["alpha"]);
+        app.selected_repo = Some(String::from("acme/repo"));
+
+        app.ensure_selected_repo();
+
+        assert!(app.selected_repo.is_none());
+    }
+
+    #[test]
+    fn select_account_clears_repo_selection() {
+        let mut app = app_with_accounts(&["alpha"]);
+        app.selected_repo = Some(String::from("acme/repo"));
+        app.show_all_accounts = true;
+
+        app.select_account(String::from("alpha"));
+
+        assert_eq!(app.selected_account_login.as_deref(), Some("alpha"));
+        assert!(app.selected_repo.is_none());
+        assert_eq!(app.repo_path_filter_login.as_deref(), Some("alpha"));
+        assert!(!app.show_all_accounts);
+    }
+
+    #[test]
+    fn show_all_repo_paths_clears_repo_path_filter() {
+        let mut app = app_with_accounts(&["alpha"]);
+        app.repo_path_filter_login = Some(String::from("alpha"));
+        app.selected_repo = Some(String::from("acme/repo"));
+
+        app.show_all_repo_paths();
+
+        assert!(app.repo_path_filter_login.is_none());
+        assert!(app.selected_repo.is_none());
+        assert!(app.show_all_accounts);
+    }
+
+    #[test]
+    fn selecting_repo_keeps_repo_path_filter_login() {
+        let mut app = app_with_accounts(&["alpha"]);
+        app.repo_paths
+            .insert(String::from("acme/repo"), String::from("/tmp/acme-repo"));
+        app.repo_path_accounts
+            .insert(String::from("acme/repo"), String::from("alpha"));
+        app.repo_path_filter_login = Some(String::from("alpha"));
+
+        app.select_repo(String::from("acme/repo"));
+
+        assert_eq!(app.repo_path_filter_login.as_deref(), Some("alpha"));
+        assert!(!app.show_all_accounts);
+    }
+
+    #[test]
     fn confirm_account_delete_matches_trimmed_exact_login() {
         assert!(ReminderApp::confirm_account_delete_matches(
             "alpha", "alpha"
@@ -1203,6 +1928,7 @@ mod tests {
         let review_settings = ReviewCommandSettings {
             env_vars: BTreeMap::from([(String::from("FOO"), String::from("bar"))]),
             additional_args: vec![String::from("--lang"), String::from("korean")],
+            ..ReviewCommandSettings::default()
         };
 
         let launch = resolve_review_launch(
@@ -1220,6 +1946,7 @@ mod tests {
                 repo: String::from("Acme/Repo"),
                 repo_path: String::from("/tmp/acme-repo"),
                 pr_number: 123,
+                pr_url: String::from("https://github.com/acme/repo/pull/123"),
                 review_settings,
             })
         );
@@ -1280,6 +2007,7 @@ mod tests {
                 repo: String::from("acme/repo"),
                 repo_path: String::from("/tmp/acme-repo"),
                 pr_number: 123,
+                pr_url: String::from("https://github.com/acme/repo/pull/123"),
                 review_settings: ReviewCommandSettings::default(),
             },
         );
@@ -1299,6 +2027,7 @@ mod tests {
                 repo: String::from("acme/repo"),
                 repo_path: String::from("/tmp/acme-repo"),
                 pr_number: 42,
+                pr_url: String::from("https://github.com/acme/repo/pull/42"),
                 review_settings: ReviewCommandSettings::default(),
             },
         );
@@ -1319,6 +2048,7 @@ mod tests {
                     repo: String::from("acme/repo"),
                     repo_path: String::from("/tmp/acme-repo"),
                     pr_number: 123,
+                    pr_url: String::from("https://github.com/acme/repo/pull/123"),
                     review_settings: ReviewCommandSettings::default(),
                 },
             ),
@@ -1352,6 +2082,7 @@ mod tests {
                     repo: String::from("acme/repo"),
                     repo_path: String::from("/tmp/acme-repo"),
                     pr_number: 123,
+                    pr_url: String::from("https://github.com/acme/repo/pull/123"),
                     review_settings: ReviewCommandSettings::default(),
                 },
             ),
@@ -1364,6 +2095,7 @@ mod tests {
                     repo: String::from("acme/repo"),
                     repo_path: String::from("/tmp/acme-repo"),
                     pr_number: 456,
+                    pr_url: String::from("https://github.com/acme/repo/pull/456"),
                     review_settings: ReviewCommandSettings::default(),
                 },
             ),
@@ -1390,6 +2122,7 @@ mod tests {
                 repo: String::from("acme/repo"),
                 repo_path: String::from("/tmp/acme-repo"),
                 pr_number: 123,
+                pr_url: String::from("https://github.com/acme/repo/pull/123"),
                 review_settings: ReviewCommandSettings::default(),
             },
         );
