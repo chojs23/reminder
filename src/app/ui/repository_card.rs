@@ -713,7 +713,7 @@ fn render_pull_request_actions(
             }
         }
         if row
-            .button("Request Review")
+            .button("Reviewers")
             .on_hover_text("Open reviewer management for this pull request.")
             .clicked()
         {
