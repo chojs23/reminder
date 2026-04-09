@@ -37,7 +37,9 @@ use self::{
 };
 
 use crate::{
-    domain::{GitHubAccount, PullRequestReviewer, ReviewCommandSettings},
+    domain::{
+        GitHubAccount, PullRequestReviewer, PullRequestReviewerStatus, ReviewCommandSettings,
+    },
     storage::AccountStore,
 };
 
@@ -57,6 +59,7 @@ const MAX_REVIEW_OUTPUT_CHARS: usize = 20_000;
 const ACTIVE_REVIEW_REPAINT_MS: u64 = 50;
 const REVIEW_REQUEST_REASON: &str = "review_requested";
 const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
+const APPROVED_REVIEW_LABEL_COLOR: Color32 = Color32::from_rgb(80, 170, 90);
 const PENDING_REVIEW_LABEL_COLOR: Color32 = Color32::from_rgb(120, 200, 255);
 
 #[cfg(target_os = "macos")]
@@ -764,7 +767,15 @@ impl ReminderApp {
                         ui.separator();
                         ui.add_space(8.0);
 
-                        ui.label("Current reviewers");
+                        ui.horizontal(|row| {
+                            row.label("Current reviewers");
+                            if let Some(summary) = summarize_current_reviewers(&current_reviewers) {
+                                row.colored_label(
+                                    summary.color(row.visuals()),
+                                    format!("• {}", summary.label()),
+                                );
+                            }
+                        });
                         if current_reviewers.is_empty() {
                             ui.weak("No current reviewers yet.");
                         } else {
@@ -1592,6 +1603,56 @@ fn parse_review_additional_args(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_owned).collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CurrentReviewerSummary {
+    Pending,
+    Approved,
+    ChangesRequested,
+}
+
+impl CurrentReviewerSummary {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Approved => "Approved",
+            Self::ChangesRequested => "Changes requested",
+        }
+    }
+
+    fn color(self, visuals: &egui::Visuals) -> Color32 {
+        match self {
+            Self::Pending => PENDING_REVIEW_LABEL_COLOR,
+            Self::Approved => APPROVED_REVIEW_LABEL_COLOR,
+            Self::ChangesRequested => visuals.error_fg_color,
+        }
+    }
+}
+
+fn summarize_current_reviewers(
+    reviewers: &[PullRequestReviewer],
+) -> Option<CurrentReviewerSummary> {
+    if reviewers.is_empty() {
+        return None;
+    }
+
+    let mut has_approved = false;
+    for reviewer in reviewers {
+        match reviewer.status {
+            PullRequestReviewerStatus::ChangesRequested => {
+                return Some(CurrentReviewerSummary::ChangesRequested);
+            }
+            PullRequestReviewerStatus::Approved => has_approved = true,
+            PullRequestReviewerStatus::Pending | PullRequestReviewerStatus::Commented => {}
+        }
+    }
+
+    if has_approved {
+        Some(CurrentReviewerSummary::Approved)
+    } else {
+        Some(CurrentReviewerSummary::Pending)
+    }
+}
+
 // -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
@@ -1723,6 +1784,13 @@ mod tests {
             storage_warning: None,
             global_error: None,
             auto_refresh: BatchRefreshScheduler::new(Duration::from_secs(1)),
+        }
+    }
+
+    fn reviewer(login: &str, status: PullRequestReviewerStatus) -> PullRequestReviewer {
+        PullRequestReviewer {
+            login: login.into(),
+            status,
         }
     }
 
@@ -2199,6 +2267,47 @@ mod tests {
         let pending = pending_review_request_ids(&inbox);
 
         assert!(pending.contains("1"));
+    }
+
+    #[test]
+    fn summarize_current_reviewers_prioritizes_changes_requested() {
+        let reviewers = vec![
+            reviewer("neo", PullRequestReviewerStatus::Approved),
+            reviewer("trinity", PullRequestReviewerStatus::ChangesRequested),
+            reviewer("morpheus", PullRequestReviewerStatus::Pending),
+        ];
+
+        assert_eq!(
+            summarize_current_reviewers(&reviewers),
+            Some(CurrentReviewerSummary::ChangesRequested)
+        );
+    }
+
+    #[test]
+    fn summarize_current_reviewers_uses_approved_when_no_changes_requested() {
+        let reviewers = vec![
+            reviewer("neo", PullRequestReviewerStatus::Commented),
+            reviewer("trinity", PullRequestReviewerStatus::Approved),
+            reviewer("morpheus", PullRequestReviewerStatus::Pending),
+        ];
+
+        assert_eq!(
+            summarize_current_reviewers(&reviewers),
+            Some(CurrentReviewerSummary::Approved)
+        );
+    }
+
+    #[test]
+    fn summarize_current_reviewers_falls_back_to_pending() {
+        let reviewers = vec![
+            reviewer("neo", PullRequestReviewerStatus::Commented),
+            reviewer("trinity", PullRequestReviewerStatus::Pending),
+        ];
+
+        assert_eq!(
+            summarize_current_reviewers(&reviewers),
+            Some(CurrentReviewerSummary::Pending)
+        );
     }
 
     #[test]
