@@ -90,7 +90,46 @@ pub struct RepoPullRequestSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PullRequestReviewers {
     pub requested_reviewers: Vec<String>,
+    pub current_reviewers: Vec<PullRequestReviewer>,
     pub reviewer_history: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestReviewer {
+    pub login: String,
+    pub status: PullRequestReviewerStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullRequestReviewerStatus {
+    Pending,
+    Approved,
+    ChangesRequested,
+    Commented,
+}
+
+impl PullRequestReviewerStatus {
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Self::Pending => "⏳",
+            Self::Approved => "✅",
+            Self::ChangesRequested => "⚠️",
+            Self::Commented => "💬",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Approved => "Approved",
+            Self::ChangesRequested => "Changes requested",
+            Self::Commented => "Commented",
+        }
+    }
+
+    pub fn is_pending(self) -> bool {
+        matches!(self, Self::Pending)
+    }
 }
 
 #[derive(Clone, Debug)]

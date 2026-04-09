@@ -37,7 +37,7 @@ use self::{
 };
 
 use crate::{
-    domain::{GitHubAccount, ReviewCommandSettings},
+    domain::{GitHubAccount, PullRequestReviewer, ReviewCommandSettings},
     storage::AccountStore,
 };
 
@@ -709,12 +709,16 @@ impl ReminderApp {
 
                 let mut open = true;
                 let title = format!("Request review: {}#{}", editor.repo, editor.pr_number);
-                let current_reviewers = editor.requested_reviewers.clone();
+                let current_reviewers = editor.current_reviewers.clone();
+                let current_reviewer_logins: Vec<_> = current_reviewers
+                    .iter()
+                    .map(|reviewer| reviewer.login.clone())
+                    .collect();
                 let history_reviewers: Vec<_> = editor
                     .reviewer_history
                     .iter()
                     .filter(|login| {
-                        !current_reviewers
+                        !current_reviewer_logins
                             .iter()
                             .any(|current| current.eq_ignore_ascii_case(login))
                     })
@@ -762,19 +766,35 @@ impl ReminderApp {
 
                         ui.label("Current reviewers");
                         if current_reviewers.is_empty() {
-                            ui.weak("No active review requests.");
+                            ui.weak("No current reviewers yet.");
                         } else {
                             ui.horizontal_wrapped(|row| {
-                                for login in &current_reviewers {
-                                    if row.small_button(login).clicked() {
-                                        editor.reviewer_login = login.clone();
-                                    }
+                                for reviewer in &current_reviewers {
+                                    let status_label = reviewer.status.label();
                                     if row
-                                        .add_enabled(!busy, egui::Button::new("🗑"))
+                                        .small_button(format!(
+                                            "{} {}",
+                                            reviewer.login,
+                                            reviewer.status.emoji()
+                                        ))
+                                        .on_hover_text(status_label)
+                                        .clicked()
+                                    {
+                                        editor.reviewer_login = reviewer.login.clone();
+                                    }
+                                    let is_requested = editor
+                                        .requested_reviewers
+                                        .iter()
+                                        .any(|login| login.eq_ignore_ascii_case(&reviewer.login));
+                                    if row
+                                        .add_enabled(
+                                            !busy && is_requested && reviewer.status.is_pending(),
+                                            egui::Button::new("🗑"),
+                                        )
                                         .on_hover_text("Remove this reviewer request.")
                                         .clicked()
                                     {
-                                        remove_login = Some(login.clone());
+                                        remove_login = Some(reviewer.login.clone());
                                     }
                                 }
                             });
@@ -1481,6 +1501,7 @@ struct ReviewRequestEditor {
     pr_title: String,
     reviewer_login: String,
     requested_reviewers: Vec<String>,
+    current_reviewers: Vec<PullRequestReviewer>,
     reviewer_history: Vec<String>,
     pending_load: bool,
     pending_action: bool,

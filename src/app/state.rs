@@ -219,12 +219,18 @@ impl AccountState {
             self.pending_review_request_load = None;
             match result {
                 Ok(outcome) => {
+                    let PullRequestReviewers {
+                        requested_reviewers,
+                        current_reviewers,
+                        reviewer_history,
+                    } = outcome.reviewers;
                     if let Some(editor) = &mut self.review_request_editor
                         && editor.repo == outcome.target.repo
                         && editor.pr_number == outcome.target.pr_number
                     {
-                        editor.requested_reviewers = outcome.reviewers.requested_reviewers;
-                        editor.reviewer_history = outcome.reviewers.reviewer_history;
+                        editor.requested_reviewers = requested_reviewers;
+                        editor.current_reviewers = current_reviewers;
+                        editor.reviewer_history = reviewer_history;
                         editor.pending_load = false;
                         editor.form_error = None;
                     }
@@ -463,6 +469,7 @@ impl AccountState {
             pr_title,
             reviewer_login: String::new(),
             requested_reviewers: Vec::new(),
+            current_reviewers: Vec::new(),
             reviewer_history: Vec::new(),
             pending_load: true,
             pending_action: false,

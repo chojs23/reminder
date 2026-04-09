@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashSet};
+
 use chrono::{DateTime, Utc};
 use reqwest::{
     blocking::Client,
@@ -8,7 +10,8 @@ use thiserror::Error;
 
 use crate::domain::{
     GitHubAccount, InboxSnapshot, MentionKind, MentionThread, NotificationItem,
-    PullRequestReviewers, RepoPullRequest, RepoPullRequestSnapshot, ReviewRequest, ReviewSummary,
+    PullRequestReviewer, PullRequestReviewerStatus, PullRequestReviewers, RepoPullRequest,
+    RepoPullRequestSnapshot, ReviewRequest, ReviewSummary,
 };
 
 const GH_NOTIFICATIONS: &str = "https://api.github.com/notifications";
@@ -143,10 +146,20 @@ pub fn fetch_pull_request_reviewers(
 
     let requested_reviewers = fetch_requested_reviewers(client, profile, repo, pr_number)?;
     let issue_events = fetch_issue_events(client, profile, repo, pr_number)?;
+    let latest_review_states = latest_submitted_reviews_by_reviewer(fetch_pull_request_reviews(
+        client, profile, repo, pr_number,
+    )?);
+    let reviewer_history = review_request_history_from_issue_events(&issue_events);
 
     Ok(PullRequestReviewers {
+        current_reviewers: build_current_reviewers(
+            &requested_reviewers,
+            &reviewer_history,
+            &latest_review_request_times_from_issue_events(&issue_events),
+            &latest_review_states,
+        ),
         requested_reviewers,
-        reviewer_history: review_request_history_from_issue_events(issue_events),
+        reviewer_history,
     })
 }
 
@@ -235,6 +248,25 @@ fn fetch_issue_events(
     issue_number: u64,
 ) -> Result<Vec<IssueEventResponse>, FetchError> {
     let url = format!("{GH_REPOS}/{repo}/issues/{issue_number}/events");
+    client
+        .get(url)
+        .query(&[("per_page", "100")])
+        .header(USER_AGENT, USER_AGENT_HEADER)
+        .header(ACCEPT, "application/vnd.github+json")
+        .bearer_auth(&profile.token)
+        .send()?
+        .error_for_status()?
+        .json()
+        .map_err(FetchError::Http)
+}
+
+fn fetch_pull_request_reviews(
+    client: &Client,
+    profile: &GitHubAccount,
+    repo: &str,
+    pr_number: u64,
+) -> Result<Vec<PullRequestReviewResponse>, FetchError> {
+    let url = format!("{GH_REPOS}/{repo}/pulls/{pr_number}/reviews");
     client
         .get(url)
         .query(&[("per_page", "100")])
@@ -358,7 +390,7 @@ fn review_requester_for_user_from_issue_events(
     current_requester
 }
 
-fn review_request_history_from_issue_events(events: Vec<IssueEventResponse>) -> Vec<String> {
+fn review_request_history_from_issue_events(events: &[IssueEventResponse]) -> Vec<String> {
     let mut reviewers: Vec<(String, DateTime<Utc>)> = Vec::new();
     for event in events {
         if !matches!(
@@ -367,7 +399,7 @@ fn review_request_history_from_issue_events(events: Vec<IssueEventResponse>) -> 
         ) {
             continue;
         }
-        let Some(requested_reviewer) = event.requested_reviewer else {
+        let Some(requested_reviewer) = event.requested_reviewer.as_ref() else {
             continue;
         };
 
@@ -375,10 +407,10 @@ fn review_request_history_from_issue_events(events: Vec<IssueEventResponse>) -> 
             .iter_mut()
             .find(|(login, _)| login.eq_ignore_ascii_case(&requested_reviewer.login))
         {
-            existing.0 = requested_reviewer.login;
+            existing.0 = requested_reviewer.login.clone();
             existing.1 = event.created_at;
         } else {
-            reviewers.push((requested_reviewer.login, event.created_at));
+            reviewers.push((requested_reviewer.login.clone(), event.created_at));
         }
     }
 
@@ -390,6 +422,116 @@ fn review_request_history_from_issue_events(events: Vec<IssueEventResponse>) -> 
         })
     });
     reviewers.into_iter().map(|(login, _)| login).collect()
+}
+
+fn latest_review_request_times_from_issue_events(
+    events: &[IssueEventResponse],
+) -> BTreeMap<String, DateTime<Utc>> {
+    let mut latest_request_times = BTreeMap::new();
+    for event in events {
+        if event.event != "review_requested" {
+            continue;
+        }
+        let Some(requested_reviewer) = event.requested_reviewer.as_ref() else {
+            continue;
+        };
+        latest_request_times.insert(
+            requested_reviewer.login.to_ascii_lowercase(),
+            event.created_at,
+        );
+    }
+    latest_request_times
+}
+
+fn latest_submitted_reviews_by_reviewer(
+    reviews: Vec<PullRequestReviewResponse>,
+) -> BTreeMap<String, SubmittedReviewState> {
+    let mut latest_reviews: BTreeMap<String, SubmittedReviewState> = BTreeMap::new();
+    for review in reviews {
+        let Some(user) = review.user else {
+            continue;
+        };
+        let Some(submitted_at) = review.submitted_at else {
+            continue;
+        };
+        let Some(status) = reviewer_status_from_review_state(&review.state) else {
+            continue;
+        };
+        let key = user.login.to_ascii_lowercase();
+        let should_replace = match latest_reviews.get(&key) {
+            None => true,
+            Some(current) => {
+                submitted_at > current.submitted_at
+                    || (submitted_at == current.submitted_at && review.id > current.review_id)
+            }
+        };
+        if should_replace {
+            latest_reviews.insert(
+                key,
+                SubmittedReviewState {
+                    review_id: review.id,
+                    submitted_at,
+                    status,
+                },
+            );
+        }
+    }
+    latest_reviews
+}
+
+fn build_current_reviewers(
+    requested_reviewers: &[String],
+    reviewer_history: &[String],
+    latest_review_request_times: &BTreeMap<String, DateTime<Utc>>,
+    latest_review_states: &BTreeMap<String, SubmittedReviewState>,
+) -> Vec<PullRequestReviewer> {
+    let requested_keys: HashSet<_> = requested_reviewers
+        .iter()
+        .map(|login| login.to_ascii_lowercase())
+        .collect();
+    let mut seen = HashSet::new();
+    let mut current_reviewers = Vec::new();
+
+    for login in requested_reviewers.iter().chain(reviewer_history.iter()) {
+        let key = login.to_ascii_lowercase();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+
+        if requested_keys.contains(&key) {
+            current_reviewers.push(PullRequestReviewer {
+                login: login.clone(),
+                status: PullRequestReviewerStatus::Pending,
+            });
+            continue;
+        }
+
+        let Some(review) = latest_review_states.get(&key) else {
+            continue;
+        };
+        if latest_review_request_times
+            .get(&key)
+            .is_some_and(|requested_at| review.submitted_at < *requested_at)
+        {
+            continue;
+        }
+
+        current_reviewers.push(PullRequestReviewer {
+            login: login.clone(),
+            status: review.status,
+        });
+    }
+
+    current_reviewers
+}
+
+fn reviewer_status_from_review_state(state: &str) -> Option<PullRequestReviewerStatus> {
+    match state {
+        "APPROVED" => Some(PullRequestReviewerStatus::Approved),
+        "CHANGES_REQUESTED" => Some(PullRequestReviewerStatus::ChangesRequested),
+        "COMMENTED" => Some(PullRequestReviewerStatus::Commented),
+        _ => None,
+    }
 }
 
 fn fetch_mentions(
@@ -540,6 +682,21 @@ struct IssueEventResponse {
     review_requester: Option<GitHubUser>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PullRequestReviewResponse {
+    id: u64,
+    state: String,
+    user: Option<GitHubUser>,
+    submitted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SubmittedReviewState {
+    review_id: u64,
+    submitted_at: DateTime<Utc>,
+    status: PullRequestReviewerStatus,
+}
+
 #[derive(Debug, Serialize)]
 struct ReviewRequestMutationBody {
     reviewers: Vec<String>,
@@ -684,8 +841,74 @@ mod tests {
         ];
 
         assert_eq!(
-            review_request_history_from_issue_events(events),
+            review_request_history_from_issue_events(&events),
             vec![String::from("neo"), String::from("trinity")]
+        );
+    }
+
+    #[test]
+    fn build_current_reviewers_keeps_completed_reviewers_visible() {
+        let requested_reviewers = vec![String::from("trinity")];
+        let reviewer_history = vec![String::from("trinity"), String::from("neo")];
+        let latest_request_times = BTreeMap::from([
+            (
+                String::from("trinity"),
+                "2026-04-03T00:00:00Z".parse().unwrap(),
+            ),
+            (String::from("neo"), "2026-04-01T00:00:00Z".parse().unwrap()),
+        ]);
+        let latest_review_states = BTreeMap::from([(
+            String::from("neo"),
+            SubmittedReviewState {
+                review_id: 7,
+                submitted_at: "2026-04-02T00:00:00Z".parse().unwrap(),
+                status: PullRequestReviewerStatus::Approved,
+            },
+        )]);
+
+        assert_eq!(
+            build_current_reviewers(
+                &requested_reviewers,
+                &reviewer_history,
+                &latest_request_times,
+                &latest_review_states,
+            ),
+            vec![
+                PullRequestReviewer {
+                    login: String::from("trinity"),
+                    status: PullRequestReviewerStatus::Pending,
+                },
+                PullRequestReviewer {
+                    login: String::from("neo"),
+                    status: PullRequestReviewerStatus::Approved,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_current_reviewers_ignores_stale_reviews_after_re_request() {
+        let requested_reviewers = Vec::new();
+        let reviewer_history = vec![String::from("neo")];
+        let latest_request_times =
+            BTreeMap::from([(String::from("neo"), "2026-04-03T00:00:00Z".parse().unwrap())]);
+        let latest_review_states = BTreeMap::from([(
+            String::from("neo"),
+            SubmittedReviewState {
+                review_id: 7,
+                submitted_at: "2026-04-02T00:00:00Z".parse().unwrap(),
+                status: PullRequestReviewerStatus::Approved,
+            },
+        )]);
+
+        assert!(
+            build_current_reviewers(
+                &requested_reviewers,
+                &reviewer_history,
+                &latest_request_times,
+                &latest_review_states,
+            )
+            .is_empty()
         );
     }
 
