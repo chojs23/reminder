@@ -32,6 +32,8 @@ use crate::domain::ReviewCommandSettings;
 
 const SHELL_STREAM_DISABLED_NOTE: &str =
     "[Shell streaming unavailable. This window still renders common ANSI styles inline.]";
+const GH_TOKEN_ENV_VAR: &str = "GH_TOKEN";
+const GITHUB_TOKEN_ENV_VAR: &str = "GITHUB_TOKEN";
 const REVIEW_TEXT_SIZE: f32 = 13.0;
 const REVIEW_TERMINAL_ROWS: u16 = 1000;
 const REVIEW_TERMINAL_COLS: u16 = 240;
@@ -784,7 +786,7 @@ pub(super) fn review_output_plain_text(review_output: &ReviewOutputState) -> Str
 }
 
 impl ReviewJob {
-    pub(super) fn spawn(thread_id: String, launch: ReviewLaunchPlan) -> Self {
+    pub(super) fn spawn(thread_id: String, launch: ReviewLaunchPlan, github_token: String) -> Self {
         let (tx, rx) = mpsc::channel();
         let worker_thread_id = thread_id.clone();
         let child = Arc::new(Mutex::new(None));
@@ -796,6 +798,7 @@ impl ReviewJob {
                 &tx,
                 &worker_thread_id,
                 &launch,
+                &github_token,
                 worker_child,
                 worker_cancel_requested,
             );
@@ -942,6 +945,7 @@ fn run_review_stream(
     tx: &mpsc::Sender<ReviewJobMessage>,
     thread_id: &str,
     launch: &ReviewLaunchPlan,
+    github_token: &str,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
@@ -961,21 +965,42 @@ fn run_review_stream(
             pr_url,
             review_settings,
             ..
-        } => run_custom_review(context, repo_path, *pr_number, pr_url, review_settings),
+        } => run_custom_review(
+            context,
+            repo_path,
+            *pr_number,
+            pr_url,
+            review_settings,
+            github_token,
+        ),
         ReviewLaunchPlan::PrDescription {
             repo_path,
             pr_number,
             pr_url,
             review_settings,
             ..
-        } => run_pr_description(context, repo_path, *pr_number, pr_url, review_settings),
+        } => run_pr_description(
+            context,
+            repo_path,
+            *pr_number,
+            pr_url,
+            review_settings,
+            github_token,
+        ),
         ReviewLaunchPlan::FollowUp {
             repo_path,
             session_id,
             prompt,
             review_settings,
             ..
-        } => run_review_follow_up(context, repo_path, session_id, prompt, review_settings),
+        } => run_review_follow_up(
+            context,
+            repo_path,
+            session_id,
+            prompt,
+            review_settings,
+            github_token,
+        ),
     }
 }
 
@@ -985,12 +1010,13 @@ fn run_custom_review(
     pr_number: u64,
     pr_url: &str,
     review_settings: &ReviewCommandSettings,
+    github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    command.envs(review_settings.env_vars.iter());
+    command.envs(review_command_envs(review_settings, github_token));
     command.arg("run");
     command.arg("--dir");
     command.arg(repo_path);
@@ -1001,7 +1027,7 @@ fn run_custom_review(
     command.arg(custom_command_prompt_message(pr_url, pr_number));
     command.arg("--");
     command.args(&review_settings.additional_args);
-    println!("Running custom review command: {:?}", command);
+    println!("Running custom review command for {}", context.review_label);
     stream_review_command(
         context.tx,
         context.thread_id,
@@ -1018,12 +1044,13 @@ fn run_pr_description(
     pr_number: u64,
     pr_url: &str,
     review_settings: &ReviewCommandSettings,
+    github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    command.envs(review_settings.env_vars.iter());
+    command.envs(review_command_envs(review_settings, github_token));
     command.arg("run");
     command.arg("--dir");
     command.arg(repo_path);
@@ -1034,7 +1061,10 @@ fn run_pr_description(
     command.arg(custom_command_prompt_message(pr_url, pr_number));
     command.arg("--");
     command.args(&review_settings.additional_args);
-    println!("Running PR description command: {:?}", command);
+    println!(
+        "Running PR description command for {}",
+        context.review_label
+    );
     stream_review_command(
         context.tx,
         context.thread_id,
@@ -1051,12 +1081,13 @@ fn run_review_follow_up(
     session_id: &str,
     prompt: &str,
     review_settings: &ReviewCommandSettings,
+    github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    command.envs(review_settings.env_vars.iter());
+    command.envs(review_command_envs(review_settings, github_token));
     command.arg("run");
     command.arg("--dir");
     command.arg(repo_path);
@@ -1066,7 +1097,10 @@ fn run_review_follow_up(
     command.arg(session_id);
     command.arg("--");
     command.arg(prompt);
-    println!("Running review follow-up command: {:?}", command);
+    println!(
+        "Running review follow-up command for {}",
+        context.review_label
+    );
     stream_review_command(
         context.tx,
         context.thread_id,
@@ -1092,7 +1126,7 @@ fn read_review_stream(
     loop {
         let bytes = match reader.read(&mut buffer) {
             Ok(bytes) => bytes,
-            Err(err) if cancel_requested.load(Ordering::SeqCst) => break,
+            Err(_err) if cancel_requested.load(Ordering::SeqCst) => break,
             Err(err) => return Err(format!("Failed to read {stream_label}: {err}")),
         };
 
@@ -1291,7 +1325,7 @@ fn stream_review_command(
         })?;
         match child.wait() {
             Ok(status) => status,
-            Err(err) if cancel_requested.load(Ordering::SeqCst) => {
+            Err(_err) if cancel_requested.load(Ordering::SeqCst) => {
                 return Ok(ReviewRunOutcome::Cancelled {
                     message: "Review canceled by user.".to_owned(),
                     session_id: stdout_capture.session_id.clone(),
@@ -1703,6 +1737,37 @@ fn custom_command_prompt_message(pr_url: &str, pr_number: u64) -> String {
     format!("PR URL: {pr_url}\nPR number: {pr_number}")
 }
 
+fn review_command_envs(
+    review_settings: &ReviewCommandSettings,
+    github_token: &str,
+) -> Vec<(String, String)> {
+    let mut envs: Vec<_> = review_settings
+        .env_vars
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    if github_token.trim().is_empty() {
+        return envs;
+    }
+
+    if !review_settings_has_env_var(review_settings, GH_TOKEN_ENV_VAR) {
+        envs.push((String::from(GH_TOKEN_ENV_VAR), github_token.to_owned()));
+    }
+    if !review_settings_has_env_var(review_settings, GITHUB_TOKEN_ENV_VAR) {
+        envs.push((String::from(GITHUB_TOKEN_ENV_VAR), github_token.to_owned()));
+    }
+
+    envs
+}
+
+fn review_settings_has_env_var(review_settings: &ReviewCommandSettings, key: &str) -> bool {
+    review_settings
+        .env_vars
+        .keys()
+        .any(|candidate| candidate.eq_ignore_ascii_case(key))
+}
+
 pub(super) fn custom_review_command_available() -> bool {
     default_review_prompt_md_path().is_some_and(|path| path.exists())
 }
@@ -1774,7 +1839,7 @@ fn default_pr_description_prompt_md_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use crate::domain::ReviewCommandSettings;
     use serde_json::json;
@@ -1783,8 +1848,9 @@ mod tests {
         ReviewCommandCapture, ReviewLaunchPlan, ansi_color_from_4bit, append_review_chunk,
         append_review_follow_up_prompt, custom_command_prompt_message,
         format_review_incomplete_output, initial_review_output_state,
-        pr_description_prompt_md_path, render_review_json_event, review_event_session_id,
-        review_output_plain_text, review_prompt_md_path, strip_ansi_escape_codes,
+        pr_description_prompt_md_path, render_review_json_event, review_command_envs,
+        review_event_session_id, review_output_plain_text, review_prompt_md_path,
+        strip_ansi_escape_codes,
     };
 
     fn review_state() -> super::ReviewOutputState {
@@ -1867,6 +1933,44 @@ mod tests {
             pr_description_prompt_md_path(&review_settings),
             Some(PathBuf::from("/tmp/custom/pr-description.md"))
         );
+    }
+
+    #[test]
+    fn review_command_envs_inject_account_token_when_missing() {
+        let review_settings = ReviewCommandSettings {
+            env_vars: BTreeMap::from([(String::from("FOO"), String::from("bar"))]),
+            ..ReviewCommandSettings::default()
+        };
+
+        let envs = review_command_envs(&review_settings, "selected-token");
+
+        assert!(envs.contains(&(String::from("FOO"), String::from("bar"))));
+        assert!(envs.contains(&(String::from("GH_TOKEN"), String::from("selected-token"))));
+        assert!(envs.contains(&(String::from("GITHUB_TOKEN"), String::from("selected-token"))));
+    }
+
+    #[test]
+    fn review_command_envs_preserve_explicit_github_auth_envs() {
+        let review_settings = ReviewCommandSettings {
+            env_vars: BTreeMap::from([
+                (String::from("gh_token"), String::from("explicit-gh")),
+                (
+                    String::from("GITHUB_TOKEN"),
+                    String::from("explicit-github"),
+                ),
+            ]),
+            ..ReviewCommandSettings::default()
+        };
+
+        let envs = review_command_envs(&review_settings, "selected-token");
+
+        assert!(envs.contains(&(String::from("gh_token"), String::from("explicit-gh"))));
+        assert!(envs.contains(&(
+            String::from("GITHUB_TOKEN"),
+            String::from("explicit-github")
+        )));
+        assert!(!envs.contains(&(String::from("GH_TOKEN"), String::from("selected-token"))));
+        assert!(!envs.contains(&(String::from("GITHUB_TOKEN"), String::from("selected-token"))));
     }
 
     #[test]

@@ -338,7 +338,7 @@ impl AccountState {
             thread_id.clone(),
             initial_review_output_state(thread_id.clone(), &launch),
         );
-        let job = ReviewJob::spawn(thread_id.clone(), launch);
+        let job = ReviewJob::spawn(thread_id.clone(), launch, self.profile.token.clone());
         self.pending_review_jobs.insert(thread_id.clone(), job);
         self.inflight_done.insert(thread_id);
     }
@@ -420,7 +420,7 @@ impl AccountState {
             String::from(review_output.output_kind.follow_up_command_label());
         review_output.pending_follow_up_prompt = Some(prompt);
 
-        let job = ReviewJob::spawn(thread_id.to_owned(), launch);
+        let job = ReviewJob::spawn(thread_id.to_owned(), launch, self.profile.token.clone());
         self.pending_review_jobs.insert(thread_id.to_owned(), job);
         self.inflight_done.insert(thread_id.to_owned());
     }
