@@ -201,7 +201,7 @@ fn render_repository_body(
         .iter()
         .filter_map(|(thread_id, review_output)| review_output.open.then_some(thread_id.clone()))
         .collect();
-    let pr_description_available =
+    let pr_description_prompt_available =
         pr_description_command_available(&account.profile.review_settings);
 
     let actions = if uses_compact_notifications(group.available_width()) {
@@ -214,7 +214,7 @@ fn render_repository_body(
             &context,
             repo_paths,
             custom_review_command,
-            pr_description_available,
+            pr_description_prompt_available,
         )
     } else {
         render_pull_request_table(
@@ -226,7 +226,7 @@ fn render_repository_body(
             &context,
             repo_paths,
             custom_review_command,
-            pr_description_available,
+            pr_description_prompt_available,
         )
     };
 
@@ -260,7 +260,7 @@ fn render_repository_body(
             } => {
                 if let Some(launch) = resolve_pr_description_launch(
                     repo_paths,
-                    pr_description_available,
+                    pr_description_prompt_available,
                     &repo,
                     pr_number,
                     &account.profile.review_settings,
@@ -316,6 +316,36 @@ struct RepoSortSignals {
 struct RepoContextInfo {
     signals: RepoSortSignals,
     review_requester: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PullRequestActionAvailability {
+    review: bool,
+    pr_description: bool,
+}
+
+fn pull_request_action_availability(
+    repo_paths: &BTreeMap<String, String>,
+    custom_review_command: bool,
+    pr_description_prompt_available: bool,
+    repo: &str,
+) -> PullRequestActionAvailability {
+    PullRequestActionAvailability {
+        review: custom_review_available_for_repo(repo_paths, custom_review_command, repo),
+        pr_description: custom_review_available_for_repo(
+            repo_paths,
+            pr_description_prompt_available,
+            repo,
+        ),
+    }
+}
+
+fn pr_description_unavailable_hover_text(pr_description_prompt_available: bool) -> &'static str {
+    if pr_description_prompt_available {
+        "Custom `pr-description` is unavailable for this repository. Add a local repo path to enable it."
+    } else {
+        "Custom `pr-description` prompt is unavailable for this account."
+    }
 }
 
 fn build_repo_context_info(account: &AccountState) -> BTreeMap<PullRequestKey, RepoContextInfo> {
@@ -489,7 +519,7 @@ fn render_pull_request_cards(
     context: &BTreeMap<PullRequestKey, RepoContextInfo>,
     repo_paths: &BTreeMap<String, String>,
     custom_review_command: bool,
-    pr_description_available: bool,
+    pr_description_prompt_available: bool,
 ) -> Vec<AccountAction> {
     let mut actions = Vec::new();
 
@@ -527,7 +557,7 @@ fn render_pull_request_cards(
                     open_review_window_thread_ids,
                     repo_paths,
                     custom_review_command,
-                    pr_description_available,
+                    pr_description_prompt_available,
                     &mut actions,
                 );
             });
@@ -547,7 +577,7 @@ fn render_pull_request_table(
     context: &BTreeMap<PullRequestKey, RepoContextInfo>,
     repo_paths: &BTreeMap<String, String>,
     custom_review_command: bool,
-    pr_description_available: bool,
+    pr_description_prompt_available: bool,
 ) -> Vec<AccountAction> {
     let mut actions = Vec::new();
 
@@ -609,7 +639,7 @@ fn render_pull_request_table(
                                     open_review_window_thread_ids,
                                     repo_paths,
                                     custom_review_command,
-                                    pr_description_available,
+                                    pr_description_prompt_available,
                                     &mut actions,
                                 );
                             });
@@ -629,13 +659,17 @@ fn render_pull_request_actions(
     open_review_window_thread_ids: &HashSet<String>,
     repo_paths: &BTreeMap<String, String>,
     custom_review_command: bool,
-    pr_description_available: bool,
+    pr_description_prompt_available: bool,
     actions: &mut Vec<AccountAction>,
 ) {
     let review_thread_id = pull_request.review_thread_id();
     let pr_description_thread_id = pull_request.pr_description_thread_id();
-    let custom_review_available =
-        custom_review_available_for_repo(repo_paths, custom_review_command, &pull_request.repo);
+    let availability = pull_request_action_availability(
+        repo_paths,
+        custom_review_command,
+        pr_description_prompt_available,
+        &pull_request.repo,
+    );
     let review_active = active_review_thread_ids.contains(&review_thread_id);
     let pr_description_active = active_review_thread_ids.contains(&pr_description_thread_id);
 
@@ -647,7 +681,7 @@ fn render_pull_request_actions(
             {
                 actions.push(AccountAction::StopReview(review_thread_id.clone()));
             }
-        } else if custom_review_available
+        } else if availability.review
             && row
                 .button("Review")
                 .on_hover_text("Run your local PR review flow.")
@@ -659,7 +693,7 @@ fn render_pull_request_actions(
                 pr_number: pull_request.number,
                 pr_url: pull_request.url.clone(),
             });
-        } else if !custom_review_available {
+        } else if !availability.review {
             row.add_enabled(false, egui::Button::new("Review"))
                 .on_hover_text("Custom `review-pr` is unavailable for this repository.");
         }
@@ -683,7 +717,7 @@ fn render_pull_request_actions(
             {
                 actions.push(AccountAction::StopReview(pr_description_thread_id.clone()));
             }
-        } else if pr_description_available
+        } else if availability.pr_description
             && row
                 .button("PR description")
                 .on_hover_text("Generate a PR description with your local flow.")
@@ -695,9 +729,11 @@ fn render_pull_request_actions(
                 pr_number: pull_request.number,
                 pr_url: pull_request.url.clone(),
             });
-        } else if !pr_description_available {
+        } else if !availability.pr_description {
             row.add_enabled(false, egui::Button::new("PR description"))
-                .on_hover_text("Custom `pr-description` prompt is unavailable for this account.");
+                .on_hover_text(pr_description_unavailable_hover_text(
+                    pr_description_prompt_available,
+                ));
         }
         if review_output_thread_ids.contains(&pr_description_thread_id) {
             let window_label = if open_review_window_thread_ids.contains(&pr_description_thread_id)
@@ -742,8 +778,9 @@ fn progress_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        RepoContextInfo, RepoSortMode, RepoSortSignals, pull_request_matches_search,
-        pull_request_summary_text, sort_pull_requests,
+        PullRequestActionAvailability, RepoContextInfo, RepoSortMode, RepoSortSignals,
+        pr_description_unavailable_hover_text, pull_request_action_availability,
+        pull_request_matches_search, pull_request_summary_text, sort_pull_requests,
     };
     use crate::{
         app::search::SearchFilter,
@@ -857,6 +894,44 @@ mod tests {
         assert_eq!(
             pull_request_summary_text(&context, &pr),
             "Review requested by alice"
+        );
+    }
+
+    #[test]
+    fn action_availability_requires_local_repo_for_pr_description() {
+        let availability =
+            pull_request_action_availability(&BTreeMap::new(), true, true, "acme/repo");
+
+        assert_eq!(
+            availability,
+            PullRequestActionAvailability {
+                review: false,
+                pr_description: false,
+            }
+        );
+    }
+
+    #[test]
+    fn action_availability_enables_pr_description_when_prompt_and_repo_exist() {
+        let mut repo_paths = BTreeMap::new();
+        repo_paths.insert(String::from("acme/repo"), String::from("/tmp/acme-repo"));
+
+        let availability = pull_request_action_availability(&repo_paths, true, true, "Acme/Repo");
+
+        assert_eq!(
+            availability,
+            PullRequestActionAvailability {
+                review: true,
+                pr_description: true,
+            }
+        );
+    }
+
+    #[test]
+    fn pr_description_hover_text_explains_missing_repo_path() {
+        assert_eq!(
+            pr_description_unavailable_hover_text(true),
+            "Custom `pr-description` is unavailable for this repository. Add a local repo path to enable it."
         );
     }
 }
