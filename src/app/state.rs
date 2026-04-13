@@ -8,12 +8,12 @@ use std::{
 use chrono::Utc;
 
 use crate::{
-    domain::{GitHubAccount, InboxSnapshot},
+    domain::{GitHubAccount, InboxSnapshot, PullRequestReviewers},
     github::{self, FetchError},
 };
 
 use super::{
-    AccountViewMode, SectionKind,
+    AccountViewMode, ReviewRequestEditor, SectionKind,
     notification_state::{collect_new_notification_ids, section_stats},
     review::{
         ReviewJob, ReviewJobMessage, ReviewLaunchPlan, ReviewOutputState, ReviewStatus,
@@ -30,6 +30,9 @@ pub(super) struct AccountState {
     pub(super) pending_job: Option<PendingJob>,
     pending_actions: Vec<NotificationActionJob>,
     pending_review_jobs: BTreeMap<String, ReviewJob>,
+    pub(super) review_request_editor: Option<ReviewRequestEditor>,
+    pending_review_request_load: Option<ReviewRequestLoadJob>,
+    pending_review_request_action: Option<ReviewRequestActionJob>,
     pub(super) expanded: bool,
     pub(super) view_mode: AccountViewMode,
     pub(super) search_query: String,
@@ -48,6 +51,9 @@ impl AccountState {
             pending_job: None,
             pending_actions: Vec::new(),
             pending_review_jobs: BTreeMap::new(),
+            review_request_editor: None,
+            pending_review_request_load: None,
+            pending_review_request_action: None,
             expanded: true,
             view_mode: AccountViewMode::Inbox,
             search_query: String::new(),
@@ -206,6 +212,78 @@ impl AccountState {
         }
     }
 
+    pub(super) fn poll_review_request_jobs(&mut self) {
+        if let Some(job) = &self.pending_review_request_load
+            && let Some(result) = job.try_take()
+        {
+            self.pending_review_request_load = None;
+            match result {
+                Ok(outcome) => {
+                    let PullRequestReviewers {
+                        requested_reviewers,
+                        current_reviewers,
+                        reviewer_history,
+                    } = outcome.reviewers;
+                    if let Some(editor) = &mut self.review_request_editor
+                        && editor.repo == outcome.target.repo
+                        && editor.pr_number == outcome.target.pr_number
+                    {
+                        editor.requested_reviewers = requested_reviewers;
+                        editor.current_reviewers = current_reviewers;
+                        editor.reviewer_history = reviewer_history;
+                        editor.pending_load = false;
+                        editor.form_error = None;
+                    }
+                }
+                Err((target, err)) => {
+                    if let Some(editor) = &mut self.review_request_editor
+                        && editor.repo == target.repo
+                        && editor.pr_number == target.pr_number
+                    {
+                        editor.pending_load = false;
+                        editor.form_error = Some(err);
+                    } else {
+                        self.last_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(job) = &self.pending_review_request_action
+            && let Some(result) = job.try_take()
+        {
+            self.pending_review_request_action = None;
+            match result {
+                Ok(outcome) => {
+                    let mut should_reload = false;
+                    if let Some(editor) = &mut self.review_request_editor
+                        && editor.repo == outcome.target.repo
+                        && editor.pr_number == outcome.target.pr_number
+                    {
+                        editor.pending_action = false;
+                        editor.status_message = Some(outcome.message);
+                        editor.form_error = None;
+                        should_reload = true;
+                    }
+                    if should_reload {
+                        self.reload_review_request_editor();
+                    }
+                }
+                Err((target, err)) => {
+                    if let Some(editor) = &mut self.review_request_editor
+                        && editor.repo == target.repo
+                        && editor.pr_number == target.pr_number
+                    {
+                        editor.pending_action = false;
+                        editor.form_error = Some(err);
+                    } else {
+                        self.last_error = Some(err);
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_action_success(&mut self, thread_id: &str) {
         if let Some(inbox) = &mut self.inbox
             && let Some(item) = inbox
@@ -260,7 +338,7 @@ impl AccountState {
             thread_id.clone(),
             initial_review_output_state(thread_id.clone(), &launch),
         );
-        let job = ReviewJob::spawn(thread_id.clone(), launch);
+        let job = ReviewJob::spawn(thread_id.clone(), launch, self.profile.token.clone());
         self.pending_review_jobs.insert(thread_id.clone(), job);
         self.inflight_done.insert(thread_id);
     }
@@ -295,8 +373,7 @@ impl AccountState {
         if self.review_is_running(thread_id) {
             if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
                 review_output.follow_up_error = Some(
-                    "Wait for the current review run to finish before sending another message."
-                        .to_owned(),
+                    "Wait for the current run to finish before sending another message.".to_owned(),
                 );
             }
             return;
@@ -305,7 +382,7 @@ impl AccountState {
         if !self.can_send_review_follow_up(thread_id) {
             if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
                 review_output.follow_up_error = Some(
-                    "This review session cannot accept follow-up because no opencode session ID was captured."
+                    "This session cannot accept follow-up because no opencode session ID was captured."
                         .to_owned(),
                 );
             }
@@ -339,10 +416,11 @@ impl AccountState {
         review_output.open = true;
         review_output.status = ReviewStatus::Running;
         review_output.captured_at = None;
-        review_output.command_label = String::from("review follow-up");
+        review_output.command_label =
+            String::from(review_output.output_kind.follow_up_command_label());
         review_output.pending_follow_up_prompt = Some(prompt);
 
-        let job = ReviewJob::spawn(thread_id.to_owned(), launch);
+        let job = ReviewJob::spawn(thread_id.to_owned(), launch, self.profile.token.clone());
         self.pending_review_jobs.insert(thread_id.to_owned(), job);
         self.inflight_done.insert(thread_id.to_owned());
     }
@@ -377,6 +455,156 @@ impl AccountState {
         if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
             review_output.open = !review_output.open;
         }
+    }
+
+    pub(super) fn open_review_request_editor(
+        &mut self,
+        repo: String,
+        pr_number: u64,
+        pr_title: String,
+    ) {
+        self.review_request_editor = Some(ReviewRequestEditor {
+            repo: repo.clone(),
+            pr_number,
+            pr_title,
+            reviewer_login: String::new(),
+            requested_reviewers: Vec::new(),
+            current_reviewers: Vec::new(),
+            reviewer_history: Vec::new(),
+            pending_load: true,
+            pending_action: false,
+            form_error: None,
+            status_message: None,
+        });
+        self.pending_review_request_action = None;
+        self.pending_review_request_load = Some(ReviewRequestLoadJob::spawn(
+            self.profile.clone(),
+            ReviewRequestTarget { repo, pr_number },
+        ));
+    }
+
+    pub(super) fn close_review_request_editor(&mut self) {
+        self.review_request_editor = None;
+        self.pending_review_request_load = None;
+        self.pending_review_request_action = None;
+    }
+
+    pub(super) fn request_pull_request_review(&mut self, reviewer_login: String) {
+        let Some((target, reviewer_login)) =
+            self.prepare_review_request_action(reviewer_login, ReviewRequestMutationKind::Request)
+        else {
+            return;
+        };
+
+        self.pending_review_request_action = Some(ReviewRequestActionJob::spawn(
+            self.profile.clone(),
+            target,
+            reviewer_login,
+            ReviewRequestMutationKind::Request,
+            false,
+        ));
+    }
+
+    pub(super) fn renotify_pull_request_review(&mut self, reviewer_login: String) {
+        let Some((target, reviewer_login)) =
+            self.prepare_review_request_action(reviewer_login, ReviewRequestMutationKind::ReNotify)
+        else {
+            return;
+        };
+        let already_requested = self.review_request_editor.as_ref().is_some_and(|editor| {
+            reviewer_list_contains(&editor.requested_reviewers, &reviewer_login)
+        });
+
+        self.pending_review_request_action = Some(ReviewRequestActionJob::spawn(
+            self.profile.clone(),
+            target,
+            reviewer_login,
+            ReviewRequestMutationKind::ReNotify,
+            already_requested,
+        ));
+    }
+
+    pub(super) fn remove_pull_request_review(&mut self, reviewer_login: String) {
+        let Some(editor) = self.review_request_editor.as_mut() else {
+            return;
+        };
+        let reviewer_login = reviewer_login.trim().to_owned();
+        if reviewer_login.is_empty() {
+            editor.form_error = Some("Enter a reviewer login first.".to_owned());
+            return;
+        }
+        if editor.pending_action {
+            return;
+        }
+
+        editor.pending_action = true;
+        editor.form_error = None;
+        editor.status_message = None;
+        let target = ReviewRequestTarget {
+            repo: editor.repo.clone(),
+            pr_number: editor.pr_number,
+        };
+        let profile = self.profile.clone();
+
+        self.pending_review_request_action = Some(ReviewRequestActionJob::spawn(
+            profile,
+            target,
+            reviewer_login,
+            ReviewRequestMutationKind::Remove,
+            false,
+        ));
+    }
+
+    fn reload_review_request_editor(&mut self) {
+        let Some(editor) = self.review_request_editor.as_mut() else {
+            return;
+        };
+
+        editor.pending_load = true;
+        let target = ReviewRequestTarget {
+            repo: editor.repo.clone(),
+            pr_number: editor.pr_number,
+        };
+        let profile = self.profile.clone();
+        self.pending_review_request_load = Some(ReviewRequestLoadJob::spawn(profile, target));
+    }
+
+    fn prepare_review_request_action(
+        &mut self,
+        reviewer_login: String,
+        action: ReviewRequestMutationKind,
+    ) -> Option<(ReviewRequestTarget, String)> {
+        let editor = self.review_request_editor.as_mut()?;
+        let reviewer_login = reviewer_login.trim().to_owned();
+        if reviewer_login.is_empty() {
+            editor.form_error = Some("Enter a reviewer login first.".to_owned());
+            return None;
+        }
+        if editor.pending_action {
+            return None;
+        }
+        if matches!(action, ReviewRequestMutationKind::Request)
+            && reviewer_list_contains(&editor.requested_reviewers, &reviewer_login)
+        {
+            editor.form_error = Some(
+                "This reviewer is already requested. Use Re-notify or remove them first."
+                    .to_owned(),
+            );
+            return None;
+        }
+
+        editor.pending_action = true;
+        editor.reviewer_login = reviewer_login.clone();
+        editor.form_error = None;
+        editor.status_message = None;
+
+        Some((
+            ReviewRequestTarget {
+                repo: editor.repo.clone(),
+                pr_number: editor.pr_number,
+            },
+            reviewer_login,
+        ))
     }
 }
 
@@ -415,6 +643,176 @@ type NotificationActionResult = Result<NotificationActionOutcome, (Option<String
 
 struct NotificationActionJob {
     receiver: Receiver<NotificationActionResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewRequestTarget {
+    repo: String,
+    pr_number: u64,
+}
+
+struct ReviewRequestLoadOutcome {
+    target: ReviewRequestTarget,
+    reviewers: PullRequestReviewers,
+}
+
+type ReviewRequestLoadResult = Result<ReviewRequestLoadOutcome, (ReviewRequestTarget, String)>;
+
+struct ReviewRequestLoadJob {
+    receiver: Receiver<ReviewRequestLoadResult>,
+}
+
+impl ReviewRequestLoadJob {
+    fn spawn(profile: GitHubAccount, target: ReviewRequestTarget) -> Self {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = Self::load_worker(profile, target);
+            let _ = tx.send(outcome);
+        });
+        Self { receiver: rx }
+    }
+
+    fn load_worker(profile: GitHubAccount, target: ReviewRequestTarget) -> ReviewRequestLoadResult {
+        let client = github::build_client().map_err(|err| (target.clone(), err.to_string()))?;
+        let reviewers =
+            github::fetch_pull_request_reviewers(&client, &profile, &target.repo, target.pr_number)
+                .map_err(|err| (target.clone(), err.to_string()))?;
+        Ok(ReviewRequestLoadOutcome { target, reviewers })
+    }
+
+    fn try_take(&self) -> Option<ReviewRequestLoadResult> {
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err((
+                ReviewRequestTarget {
+                    repo: String::new(),
+                    pr_number: 0,
+                },
+                "Review request worker disconnected".to_owned(),
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReviewRequestMutationKind {
+    Request,
+    Remove,
+    ReNotify,
+}
+
+struct ReviewRequestActionOutcome {
+    target: ReviewRequestTarget,
+    message: String,
+}
+
+type ReviewRequestActionResult = Result<ReviewRequestActionOutcome, (ReviewRequestTarget, String)>;
+
+struct ReviewRequestActionJob {
+    receiver: Receiver<ReviewRequestActionResult>,
+}
+
+impl ReviewRequestActionJob {
+    fn spawn(
+        profile: GitHubAccount,
+        target: ReviewRequestTarget,
+        reviewer_login: String,
+        action: ReviewRequestMutationKind,
+        already_requested: bool,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome =
+                Self::action_worker(profile, target, reviewer_login, action, already_requested);
+            let _ = tx.send(outcome);
+        });
+        Self { receiver: rx }
+    }
+
+    fn action_worker(
+        profile: GitHubAccount,
+        target: ReviewRequestTarget,
+        reviewer_login: String,
+        action: ReviewRequestMutationKind,
+        already_requested: bool,
+    ) -> ReviewRequestActionResult {
+        let client = github::build_client().map_err(|err| (target.clone(), err.to_string()))?;
+        match action {
+            ReviewRequestMutationKind::Request => {
+                github::request_pull_request_reviewer(
+                    &client,
+                    &profile,
+                    &target.repo,
+                    target.pr_number,
+                    &reviewer_login,
+                )
+                .map_err(|err| (target.clone(), err.to_string()))?;
+                Ok(ReviewRequestActionOutcome {
+                    target,
+                    message: format!("Requested review from {reviewer_login}."),
+                })
+            }
+            ReviewRequestMutationKind::Remove => {
+                github::remove_pull_request_reviewer(
+                    &client,
+                    &profile,
+                    &target.repo,
+                    target.pr_number,
+                    &reviewer_login,
+                )
+                .map_err(|err| (target.clone(), err.to_string()))?;
+                Ok(ReviewRequestActionOutcome {
+                    target,
+                    message: format!("Removed review request for {reviewer_login}."),
+                })
+            }
+            ReviewRequestMutationKind::ReNotify => {
+                if already_requested {
+                    github::remove_pull_request_reviewer(
+                        &client,
+                        &profile,
+                        &target.repo,
+                        target.pr_number,
+                        &reviewer_login,
+                    )
+                    .map_err(|err| (target.clone(), err.to_string()))?;
+                }
+                github::request_pull_request_reviewer(
+                    &client,
+                    &profile,
+                    &target.repo,
+                    target.pr_number,
+                    &reviewer_login,
+                )
+                .map_err(|err| (target.clone(), err.to_string()))?;
+                Ok(ReviewRequestActionOutcome {
+                    target,
+                    message: format!("Re-notified {reviewer_login}."),
+                })
+            }
+        }
+    }
+
+    fn try_take(&self) -> Option<ReviewRequestActionResult> {
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err((
+                ReviewRequestTarget {
+                    repo: String::new(),
+                    pr_number: 0,
+                },
+                "Review request action worker disconnected".to_owned(),
+            ))),
+        }
+    }
+}
+
+fn reviewer_list_contains(reviewers: &[String], reviewer_login: &str) -> bool {
+    reviewers
+        .iter()
+        .any(|login| login.eq_ignore_ascii_case(reviewer_login))
 }
 
 impl NotificationActionJob {
@@ -490,6 +888,7 @@ mod tests {
                 repo: String::from("acme/repo"),
                 repo_path: String::from("/tmp/acme-repo"),
                 pr_number: 42,
+                pr_url: String::from("https://github.com/acme/repo/pull/42"),
                 review_settings: ReviewCommandSettings::default(),
             },
         )

@@ -14,6 +14,8 @@ pub struct StoredAccounts {
     pub accounts: Vec<StoredAccount>,
     #[serde(default)]
     pub repo_paths: BTreeMap<String, String>,
+    #[serde(default)]
+    pub repo_path_accounts: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -51,8 +53,18 @@ impl StoredAccounts {
         self.repo_paths.insert(repo.to_owned(), path.to_owned());
     }
 
+    fn upsert_repo_path_account(&mut self, repo: &str, login: &str) {
+        self.repo_path_accounts
+            .insert(repo.to_owned(), login.to_owned());
+    }
+
     fn remove_repo_path(&mut self, repo: &str) {
         self.repo_paths.remove(repo);
+        self.repo_path_accounts.remove(repo);
+    }
+
+    fn remove_repo_path_account(&mut self, repo: &str) {
+        self.repo_path_accounts.remove(repo);
     }
 }
 
@@ -63,6 +75,7 @@ pub struct AccountStore {
 pub struct HydrationOutcome {
     pub profiles: Vec<GitHubAccount>,
     pub repo_paths: BTreeMap<String, String>,
+    pub repo_path_accounts: BTreeMap<String, String>,
 }
 
 impl AccountStore {
@@ -92,6 +105,7 @@ impl AccountStore {
         Ok(HydrationOutcome {
             profiles,
             repo_paths: registry.repo_paths,
+            repo_path_accounts: registry.repo_path_accounts,
         })
     }
 
@@ -109,9 +123,37 @@ impl AccountStore {
         Ok(())
     }
 
-    pub fn persist_repo_path(&self, repo: &str, path: &str) -> Result<(), SecretStoreError> {
+    pub fn persist_repo_path(
+        &self,
+        repo: &str,
+        path: &str,
+        login: Option<&str>,
+    ) -> Result<(), SecretStoreError> {
         let mut registry = self.read_registry()?;
         registry.upsert_repo_path(repo, path);
+        if let Some(login) = login {
+            registry.upsert_repo_path_account(repo, login);
+        } else {
+            registry.remove_repo_path_account(repo);
+        }
+        self.write_registry(&registry)?;
+        Ok(())
+    }
+
+    pub fn persist_repo_path_account(
+        &self,
+        repo: &str,
+        login: &str,
+    ) -> Result<(), SecretStoreError> {
+        let mut registry = self.read_registry()?;
+        registry.upsert_repo_path_account(repo, login);
+        self.write_registry(&registry)?;
+        Ok(())
+    }
+
+    pub fn clear_repo_path_account(&self, repo: &str) -> Result<(), SecretStoreError> {
+        let mut registry = self.read_registry()?;
+        registry.remove_repo_path_account(repo);
         self.write_registry(&registry)?;
         Ok(())
     }
@@ -170,5 +212,18 @@ mod tests {
                 .additional_args
                 .is_empty()
         );
+        assert!(
+            stored.accounts[0]
+                .review_settings
+                .review_prompt_md_path
+                .is_none()
+        );
+        assert!(
+            stored.accounts[0]
+                .review_settings
+                .pr_description_md_path
+                .is_none()
+        );
+        assert!(stored.repo_path_accounts.is_empty());
     }
 }

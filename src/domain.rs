@@ -11,6 +11,10 @@ pub struct ReviewCommandSettings {
     pub env_vars: BTreeMap<String, String>,
     #[serde(default)]
     pub additional_args: Vec<String>,
+    #[serde(default)]
+    pub review_prompt_md_path: Option<String>,
+    #[serde(default)]
+    pub pr_description_md_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -74,6 +78,87 @@ impl NotificationItem {
             }
             None => self.title.clone(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RepoPullRequestSnapshot {
+    pub pull_requests: Vec<RepoPullRequest>,
+    pub fetched_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PullRequestReviewers {
+    pub requested_reviewers: Vec<String>,
+    pub current_reviewers: Vec<PullRequestReviewer>,
+    pub reviewer_history: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestReviewer {
+    pub login: String,
+    pub status: PullRequestReviewerStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullRequestReviewerStatus {
+    Pending,
+    Approved,
+    ChangesRequested,
+    Commented,
+}
+
+impl PullRequestReviewerStatus {
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Self::Pending => "⏳",
+            Self::Approved => "✅",
+            Self::ChangesRequested => "⚠️",
+            Self::Commented => "💬",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Approved => "Approved",
+            Self::ChangesRequested => "Changes requested",
+            Self::Commented => "Commented",
+        }
+    }
+
+    pub fn is_pending(self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RepoPullRequest {
+    pub repo: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub updated_at: DateTime<Utc>,
+    pub author_login: Option<String>,
+    pub draft: bool,
+}
+
+impl RepoPullRequest {
+    pub fn display_title(&self) -> String {
+        let prefix = format!("#{} ", self.number);
+        if self.title.starts_with(&prefix) {
+            self.title.clone()
+        } else {
+            format!("{prefix}{}", self.title)
+        }
+    }
+
+    pub fn review_thread_id(&self) -> String {
+        format!("repo-pr:{}#{}", self.repo, self.number)
+    }
+
+    pub fn pr_description_thread_id(&self) -> String {
+        format!("repo-pr-description:{}#{}", self.repo, self.number)
     }
 }
 
@@ -166,7 +251,7 @@ impl ReviewSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::NotificationItem;
+    use super::{NotificationItem, RepoPullRequest};
     use chrono::Utc;
 
     fn notification(url: Option<&str>) -> NotificationItem {
@@ -249,5 +334,53 @@ mod tests {
         let item = notification(Some("https://github.com/acme/repo/discussions/99"));
 
         assert_eq!(item.display_title(), "Title");
+    }
+
+    #[test]
+    fn repo_pull_request_display_title_prefixes_number() {
+        let pull_request = RepoPullRequest {
+            repo: "acme/repo".into(),
+            number: 123,
+            title: "Improve filtering".into(),
+            url: "https://github.com/acme/repo/pull/123".into(),
+            updated_at: Utc::now(),
+            author_login: Some("neo".into()),
+            draft: false,
+        };
+
+        assert_eq!(pull_request.display_title(), "#123 Improve filtering");
+    }
+
+    #[test]
+    fn repo_pull_request_review_thread_id_is_stable() {
+        let pull_request = RepoPullRequest {
+            repo: "acme/repo".into(),
+            number: 123,
+            title: "Improve filtering".into(),
+            url: "https://github.com/acme/repo/pull/123".into(),
+            updated_at: Utc::now(),
+            author_login: Some("neo".into()),
+            draft: false,
+        };
+
+        assert_eq!(pull_request.review_thread_id(), "repo-pr:acme/repo#123");
+    }
+
+    #[test]
+    fn repo_pull_request_pr_description_thread_id_is_stable() {
+        let pull_request = RepoPullRequest {
+            repo: "acme/repo".into(),
+            number: 123,
+            title: "Improve filters".into(),
+            url: "https://github.com/acme/repo/pull/123".into(),
+            updated_at: Utc::now(),
+            author_login: Some("neo".into()),
+            draft: false,
+        };
+
+        assert_eq!(
+            pull_request.pr_description_thread_id(),
+            "repo-pr-description:acme/repo#123"
+        );
     }
 }

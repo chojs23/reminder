@@ -25,21 +25,57 @@ use vt100::Parser as TerminalParser;
 #[cfg(test)]
 use super::MAX_REVIEW_OUTPUT_CHARS;
 use super::time::format_local_timestamp;
-use super::{CUSTOM_REVIEW_COMMAND_NAME, repo_paths::canonical_repo_key};
+use super::{
+    CUSTOM_PR_DESCRIPTION_COMMAND_NAME, CUSTOM_REVIEW_COMMAND_NAME, repo_paths::canonical_repo_key,
+};
 use crate::domain::ReviewCommandSettings;
 
 const SHELL_STREAM_DISABLED_NOTE: &str =
     "[Shell streaming unavailable. This window still renders common ANSI styles inline.]";
+const GH_TOKEN_ENV_VAR: &str = "GH_TOKEN";
+const GITHUB_TOKEN_ENV_VAR: &str = "GITHUB_TOKEN";
 const REVIEW_TEXT_SIZE: f32 = 13.0;
 const REVIEW_TERMINAL_ROWS: u16 = 1000;
 const REVIEW_TERMINAL_COLS: u16 = 240;
 
 static SHELL_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReviewOutputKind {
+    Review,
+    PrDescription,
+}
+
+impl ReviewOutputKind {
+    fn subject_label(self) -> &'static str {
+        match self {
+            Self::Review => "Review",
+            Self::PrDescription => "PR description",
+        }
+    }
+
+    pub(super) fn follow_up_command_label(self) -> &'static str {
+        match self {
+            Self::Review => "review follow-up",
+            Self::PrDescription => "pr-description follow-up",
+        }
+    }
+
+    fn unavailable_session_message(self) -> &'static str {
+        match self {
+            Self::Review => "Unavailable because this review run did not expose a session ID.",
+            Self::PrDescription => {
+                "Unavailable because this description run did not expose a session ID."
+            }
+        }
+    }
+}
+
 pub(super) struct ReviewOutputState {
     pub(super) thread_id: String,
     pub(super) target: String,
     pub(super) repo_path: String,
+    pub(super) output_kind: ReviewOutputKind,
     pub(super) command_label: String,
     pub(super) captured_at: Option<chrono::DateTime<Utc>>,
     pub(super) session_id: Option<String>,
@@ -228,6 +264,9 @@ fn shell_output_lock() -> &'static Mutex<()> {
 fn review_shell_label(launch: &ReviewLaunchPlan) -> String {
     match launch {
         ReviewLaunchPlan::Custom {
+            repo, pr_number, ..
+        }
+        | ReviewLaunchPlan::PrDescription {
             repo, pr_number, ..
         } => format!("{repo}#{pr_number}"),
         ReviewLaunchPlan::FollowUp { target, .. } => target.clone(),
@@ -747,7 +786,7 @@ pub(super) fn review_output_plain_text(review_output: &ReviewOutputState) -> Str
 }
 
 impl ReviewJob {
-    pub(super) fn spawn(thread_id: String, launch: ReviewLaunchPlan) -> Self {
+    pub(super) fn spawn(thread_id: String, launch: ReviewLaunchPlan, github_token: String) -> Self {
         let (tx, rx) = mpsc::channel();
         let worker_thread_id = thread_id.clone();
         let child = Arc::new(Mutex::new(None));
@@ -759,6 +798,7 @@ impl ReviewJob {
                 &tx,
                 &worker_thread_id,
                 &launch,
+                &github_token,
                 worker_child,
                 worker_cancel_requested,
             );
@@ -878,6 +918,14 @@ pub(super) enum ReviewLaunchPlan {
         repo: String,
         repo_path: String,
         pr_number: u64,
+        pr_url: String,
+        review_settings: ReviewCommandSettings,
+    },
+    PrDescription {
+        repo: String,
+        repo_path: String,
+        pr_number: u64,
+        pr_url: String,
         review_settings: ReviewCommandSettings,
     },
     FollowUp {
@@ -897,6 +945,7 @@ fn run_review_stream(
     tx: &mpsc::Sender<ReviewJobMessage>,
     thread_id: &str,
     launch: &ReviewLaunchPlan,
+    github_token: &str,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
@@ -913,16 +962,45 @@ fn run_review_stream(
         ReviewLaunchPlan::Custom {
             repo_path,
             pr_number,
+            pr_url,
             review_settings,
             ..
-        } => run_custom_review(context, repo_path, *pr_number, review_settings),
+        } => run_custom_review(
+            context,
+            repo_path,
+            *pr_number,
+            pr_url,
+            review_settings,
+            github_token,
+        ),
+        ReviewLaunchPlan::PrDescription {
+            repo_path,
+            pr_number,
+            pr_url,
+            review_settings,
+            ..
+        } => run_pr_description(
+            context,
+            repo_path,
+            *pr_number,
+            pr_url,
+            review_settings,
+            github_token,
+        ),
         ReviewLaunchPlan::FollowUp {
             repo_path,
             session_id,
             prompt,
             review_settings,
             ..
-        } => run_review_follow_up(context, repo_path, session_id, prompt, review_settings),
+        } => run_review_follow_up(
+            context,
+            repo_path,
+            session_id,
+            prompt,
+            review_settings,
+            github_token,
+        ),
     }
 }
 
@@ -930,13 +1008,15 @@ fn run_custom_review(
     context: ReviewRunContext<'_>,
     repo_path: &str,
     pr_number: u64,
+    pr_url: &str,
     review_settings: &ReviewCommandSettings,
+    github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    command.envs(review_settings.env_vars.iter());
+    command.envs(review_command_envs(review_settings, github_token));
     command.arg("run");
     command.arg("--dir");
     command.arg(repo_path);
@@ -944,10 +1024,47 @@ fn run_custom_review(
     command.arg("json");
     command.arg("--command");
     command.arg(CUSTOM_REVIEW_COMMAND_NAME);
-    command.arg(pr_number.to_string());
+    command.arg(custom_command_prompt_message(pr_url, pr_number));
     command.arg("--");
     command.args(&review_settings.additional_args);
-    println!("Running custom review command: {:?}", command);
+    println!("Running custom review command for {}", context.review_label);
+    stream_review_command(
+        context.tx,
+        context.thread_id,
+        context.review_label,
+        command,
+        context.child_handle,
+        context.cancel_requested,
+    )
+}
+
+fn run_pr_description(
+    context: ReviewRunContext<'_>,
+    repo_path: &str,
+    pr_number: u64,
+    pr_url: &str,
+    review_settings: &ReviewCommandSettings,
+    github_token: &str,
+) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    let mut command = Command::new("opencode");
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.envs(review_command_envs(review_settings, github_token));
+    command.arg("run");
+    command.arg("--dir");
+    command.arg(repo_path);
+    command.arg("--format");
+    command.arg("json");
+    command.arg("--command");
+    command.arg(CUSTOM_PR_DESCRIPTION_COMMAND_NAME);
+    command.arg(custom_command_prompt_message(pr_url, pr_number));
+    command.arg("--");
+    command.args(&review_settings.additional_args);
+    println!(
+        "Running PR description command for {}",
+        context.review_label
+    );
     stream_review_command(
         context.tx,
         context.thread_id,
@@ -964,12 +1081,13 @@ fn run_review_follow_up(
     session_id: &str,
     prompt: &str,
     review_settings: &ReviewCommandSettings,
+    github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    command.envs(review_settings.env_vars.iter());
+    command.envs(review_command_envs(review_settings, github_token));
     command.arg("run");
     command.arg("--dir");
     command.arg(repo_path);
@@ -979,7 +1097,10 @@ fn run_review_follow_up(
     command.arg(session_id);
     command.arg("--");
     command.arg(prompt);
-    println!("Running review follow-up command: {:?}", command);
+    println!(
+        "Running review follow-up command for {}",
+        context.review_label
+    );
     stream_review_command(
         context.tx,
         context.thread_id,
@@ -1005,7 +1126,7 @@ fn read_review_stream(
     loop {
         let bytes = match reader.read(&mut buffer) {
             Ok(bytes) => bytes,
-            Err(err) if cancel_requested.load(Ordering::SeqCst) => break,
+            Err(_err) if cancel_requested.load(Ordering::SeqCst) => break,
             Err(err) => return Err(format!("Failed to read {stream_label}: {err}")),
         };
 
@@ -1204,7 +1325,7 @@ fn stream_review_command(
         })?;
         match child.wait() {
             Ok(status) => status,
-            Err(err) if cancel_requested.load(Ordering::SeqCst) => {
+            Err(_err) if cancel_requested.load(Ordering::SeqCst) => {
                 return Ok(ReviewRunOutcome::Cancelled {
                     message: "Review canceled by user.".to_owned(),
                     session_id: stdout_capture.session_id.clone(),
@@ -1340,11 +1461,37 @@ pub(super) fn initial_review_output_state(
             repo_path,
             pr_number,
             review_settings,
+            ..
         } => ReviewOutputState {
             thread_id,
             target: format!("{repo}#{pr_number}"),
             repo_path: repo_path.clone(),
+            output_kind: ReviewOutputKind::Review,
             command_label: String::from(CUSTOM_REVIEW_COMMAND_NAME),
+            captured_at: None,
+            session_id: None,
+            review_settings: review_settings.clone(),
+            follow_up_draft: String::new(),
+            follow_up_error: None,
+            pending_follow_up_prompt: None,
+            terminal: new_review_terminal(),
+            styled_spans: Vec::new(),
+            open: true,
+            status: ReviewStatus::Running,
+            dropped_chars: 0,
+        },
+        ReviewLaunchPlan::PrDescription {
+            repo,
+            repo_path,
+            pr_number,
+            review_settings,
+            ..
+        } => ReviewOutputState {
+            thread_id,
+            target: format!("{repo}#{pr_number}"),
+            repo_path: repo_path.clone(),
+            output_kind: ReviewOutputKind::PrDescription,
+            command_label: String::from(CUSTOM_PR_DESCRIPTION_COMMAND_NAME),
             captured_at: None,
             session_id: None,
             review_settings: review_settings.clone(),
@@ -1370,10 +1517,12 @@ pub(super) fn append_review_chunk(review_output: &mut ReviewOutputState, chunk: 
 
 pub(super) fn review_summary_text(review_output: &ReviewOutputState) -> String {
     let status = match review_output.status {
-        ReviewStatus::Running => "Review running",
-        ReviewStatus::Completed => "Review ready",
-        ReviewStatus::Cancelled => "Review canceled",
-        ReviewStatus::Failed => "Review failed",
+        ReviewStatus::Running => format!("{} running", review_output.output_kind.subject_label()),
+        ReviewStatus::Completed => format!("{} ready", review_output.output_kind.subject_label()),
+        ReviewStatus::Cancelled => {
+            format!("{} canceled", review_output.output_kind.subject_label())
+        }
+        ReviewStatus::Failed => format!("{} failed", review_output.output_kind.subject_label()),
     };
 
     match review_output.captured_at {
@@ -1405,10 +1554,26 @@ pub(super) fn render_review_window(
     }
 
     let title = match review_output.status {
-        ReviewStatus::Running => format!("Review in progress: {}", review_output.target),
-        ReviewStatus::Completed => format!("Review output: {}", review_output.target),
-        ReviewStatus::Cancelled => format!("Review canceled: {}", review_output.target),
-        ReviewStatus::Failed => format!("Review failed: {}", review_output.target),
+        ReviewStatus::Running => format!(
+            "{} in progress: {}",
+            review_output.output_kind.subject_label(),
+            review_output.target
+        ),
+        ReviewStatus::Completed => format!(
+            "{} output: {}",
+            review_output.output_kind.subject_label(),
+            review_output.target
+        ),
+        ReviewStatus::Cancelled => format!(
+            "{} canceled: {}",
+            review_output.output_kind.subject_label(),
+            review_output.target
+        ),
+        ReviewStatus::Failed => format!(
+            "{} failed: {}",
+            review_output.output_kind.subject_label(),
+            review_output.target
+        ),
     };
     let mut open = review_output.open;
     let status_line = review_summary_text(review_output);
@@ -1456,7 +1621,7 @@ pub(super) fn render_review_window(
             ui.add_space(8.0);
 
             if review_output.session_id.is_none() {
-                ui.small("Unavailable because this review did not expose an session ID.");
+                ui.small(review_output.output_kind.unavailable_session_message());
             }
 
             let draft_is_empty = review_output.follow_up_draft.trim().is_empty();
@@ -1522,7 +1687,7 @@ pub(super) fn resolve_review_launch(
     repo: &str,
     pr_number: u64,
     review_settings: &ReviewCommandSettings,
-    _pr_url: &str,
+    pr_url: &str,
 ) -> Option<ReviewLaunchPlan> {
     if !custom_review_available_for_repo(repo_paths, custom_review_command, repo) {
         return None;
@@ -1537,15 +1702,122 @@ pub(super) fn resolve_review_launch(
         repo: repo.to_owned(),
         repo_path: repo_path.clone(),
         pr_number,
+        pr_url: pr_url.to_owned(),
         review_settings: review_settings.clone(),
     })
 }
 
-pub(super) fn custom_review_command_available() -> bool {
-    custom_review_command_path().is_some_and(|path| path.exists())
+pub(super) fn resolve_pr_description_launch(
+    repo_paths: &BTreeMap<String, String>,
+    pr_description_available: bool,
+    repo: &str,
+    pr_number: u64,
+    review_settings: &ReviewCommandSettings,
+    pr_url: &str,
+) -> Option<ReviewLaunchPlan> {
+    if !custom_review_available_for_repo(repo_paths, pr_description_available, repo) {
+        return None;
+    }
+
+    let repo_key = canonical_repo_key(repo).expect("custom review availability checked");
+    let repo_path = repo_paths
+        .get(&repo_key)
+        .expect("custom review availability checked");
+
+    Some(ReviewLaunchPlan::PrDescription {
+        repo: repo.to_owned(),
+        repo_path: repo_path.clone(),
+        pr_number,
+        pr_url: pr_url.to_owned(),
+        review_settings: review_settings.clone(),
+    })
 }
 
-fn custom_review_command_path() -> Option<PathBuf> {
+fn custom_command_prompt_message(pr_url: &str, pr_number: u64) -> String {
+    format!("PR URL: {pr_url}\nPR number: {pr_number}")
+}
+
+fn review_command_envs(
+    review_settings: &ReviewCommandSettings,
+    github_token: &str,
+) -> Vec<(String, String)> {
+    let mut envs: Vec<_> = review_settings
+        .env_vars
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    if github_token.trim().is_empty() {
+        return envs;
+    }
+
+    if !review_settings_has_env_var(review_settings, GH_TOKEN_ENV_VAR) {
+        envs.push((String::from(GH_TOKEN_ENV_VAR), github_token.to_owned()));
+    }
+    if !review_settings_has_env_var(review_settings, GITHUB_TOKEN_ENV_VAR) {
+        envs.push((String::from(GITHUB_TOKEN_ENV_VAR), github_token.to_owned()));
+    }
+
+    envs
+}
+
+fn review_settings_has_env_var(review_settings: &ReviewCommandSettings, key: &str) -> bool {
+    review_settings
+        .env_vars
+        .keys()
+        .any(|candidate| candidate.eq_ignore_ascii_case(key))
+}
+
+pub(super) fn custom_review_command_available() -> bool {
+    default_review_prompt_md_path().is_some_and(|path| path.exists())
+}
+
+pub(super) fn review_prompt_command_available(review_settings: &ReviewCommandSettings) -> bool {
+    review_prompt_md_path(review_settings).is_some_and(|path| path.exists())
+}
+
+pub(super) fn pr_description_command_available(review_settings: &ReviewCommandSettings) -> bool {
+    pr_description_prompt_md_path(review_settings).is_some_and(|path| path.exists())
+}
+
+pub(super) fn default_review_prompt_md_path_display() -> String {
+    default_review_prompt_md_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Unavailable (set HOME or XDG_CONFIG_HOME)".to_owned())
+}
+
+pub(super) fn default_pr_description_prompt_md_path_display() -> String {
+    default_pr_description_prompt_md_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Unavailable (set HOME or XDG_CONFIG_HOME)".to_owned())
+}
+
+fn review_prompt_md_path(review_settings: &ReviewCommandSettings) -> Option<PathBuf> {
+    configured_prompt_md_path(
+        review_settings.review_prompt_md_path.as_deref(),
+        default_review_prompt_md_path,
+    )
+}
+
+fn pr_description_prompt_md_path(review_settings: &ReviewCommandSettings) -> Option<PathBuf> {
+    configured_prompt_md_path(
+        review_settings.pr_description_md_path.as_deref(),
+        default_pr_description_prompt_md_path,
+    )
+}
+
+fn configured_prompt_md_path(
+    configured_path: Option<&str>,
+    default_path: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    configured_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(default_path)
+}
+
+fn default_review_prompt_md_path() -> Option<PathBuf> {
     if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(config_home).join("opencode/commands/review-pr.md"));
     }
@@ -1555,16 +1827,30 @@ fn custom_review_command_path() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".config/opencode/commands/review-pr.md"))
 }
 
+fn default_pr_description_prompt_md_path() -> Option<PathBuf> {
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(config_home).join("opencode/commands/pr-description.md"));
+    }
+
+    env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".config/opencode/commands/pr-description.md"))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
     use crate::domain::ReviewCommandSettings;
     use serde_json::json;
 
     use super::{
         ReviewCommandCapture, ReviewLaunchPlan, ansi_color_from_4bit, append_review_chunk,
-        append_review_follow_up_prompt, format_review_incomplete_output,
-        initial_review_output_state, render_review_json_event, review_event_session_id,
-        review_output_plain_text, strip_ansi_escape_codes,
+        append_review_follow_up_prompt, custom_command_prompt_message,
+        format_review_incomplete_output, initial_review_output_state,
+        pr_description_prompt_md_path, render_review_json_event, review_command_envs,
+        review_event_session_id, review_output_plain_text, review_prompt_md_path,
+        strip_ansi_escape_codes,
     };
 
     fn review_state() -> super::ReviewOutputState {
@@ -1574,6 +1860,7 @@ mod tests {
                 repo: String::from("acme/repo"),
                 repo_path: String::from("/tmp/acme-repo"),
                 pr_number: 123,
+                pr_url: String::from("https://github.com/acme/repo/pull/123"),
                 review_settings: ReviewCommandSettings::default(),
             },
         )
@@ -1620,6 +1907,78 @@ mod tests {
             review_output.styled_spans[0].style.foreground,
             Some(ansi_color_from_4bit(1, false))
         );
+    }
+
+    #[test]
+    fn review_prompt_path_prefers_configured_override() {
+        let review_settings = ReviewCommandSettings {
+            review_prompt_md_path: Some(String::from("/tmp/custom/review-pr.md")),
+            ..ReviewCommandSettings::default()
+        };
+
+        assert_eq!(
+            review_prompt_md_path(&review_settings),
+            Some(PathBuf::from("/tmp/custom/review-pr.md"))
+        );
+    }
+
+    #[test]
+    fn pr_description_prompt_path_prefers_configured_override() {
+        let review_settings = ReviewCommandSettings {
+            pr_description_md_path: Some(String::from("/tmp/custom/pr-description.md")),
+            ..ReviewCommandSettings::default()
+        };
+
+        assert_eq!(
+            pr_description_prompt_md_path(&review_settings),
+            Some(PathBuf::from("/tmp/custom/pr-description.md"))
+        );
+    }
+
+    #[test]
+    fn review_command_envs_inject_account_token_when_missing() {
+        let review_settings = ReviewCommandSettings {
+            env_vars: BTreeMap::from([(String::from("FOO"), String::from("bar"))]),
+            ..ReviewCommandSettings::default()
+        };
+
+        let envs = review_command_envs(&review_settings, "selected-token");
+
+        assert!(envs.contains(&(String::from("FOO"), String::from("bar"))));
+        assert!(envs.contains(&(String::from("GH_TOKEN"), String::from("selected-token"))));
+        assert!(envs.contains(&(String::from("GITHUB_TOKEN"), String::from("selected-token"))));
+    }
+
+    #[test]
+    fn review_command_envs_preserve_explicit_github_auth_envs() {
+        let review_settings = ReviewCommandSettings {
+            env_vars: BTreeMap::from([
+                (String::from("gh_token"), String::from("explicit-gh")),
+                (
+                    String::from("GITHUB_TOKEN"),
+                    String::from("explicit-github"),
+                ),
+            ]),
+            ..ReviewCommandSettings::default()
+        };
+
+        let envs = review_command_envs(&review_settings, "selected-token");
+
+        assert!(envs.contains(&(String::from("gh_token"), String::from("explicit-gh"))));
+        assert!(envs.contains(&(
+            String::from("GITHUB_TOKEN"),
+            String::from("explicit-github")
+        )));
+        assert!(!envs.contains(&(String::from("GH_TOKEN"), String::from("selected-token"))));
+        assert!(!envs.contains(&(String::from("GITHUB_TOKEN"), String::from("selected-token"))));
+    }
+
+    #[test]
+    fn custom_command_prompt_message_includes_pr_url() {
+        let message = custom_command_prompt_message("https://github.com/acme/repo/pull/123", 123);
+
+        assert!(message.contains("PR URL: https://github.com/acme/repo/pull/123"));
+        assert!(message.contains("PR number: 123"));
     }
 
     #[test]

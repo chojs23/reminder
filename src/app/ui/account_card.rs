@@ -176,6 +176,7 @@ fn render_account_body(
                         );
                     }
                 }
+                AccountAction::PrDescription { .. } | AccountAction::OpenReviewRequest { .. } => {}
                 AccountAction::StopReview(id) => account.cancel_review(&id),
                 AccountAction::ToggleReviewWindow(id) => {
                     account.toggle_review_window_for_thread(&id)
