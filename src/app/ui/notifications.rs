@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, HashSet};
 
-use eframe::egui::{self, RichText};
+use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
-use crate::domain::NotificationItem;
+use crate::domain::{NotificationItem, PullRequestReviewerStatus};
+
+const APPROVED_TITLE_CHECK_COLOR: Color32 = Color32::from_rgb(80, 170, 90);
 
 use super::super::{
     AccountAction, PENDING_REVIEW_LABEL_COLOR, SectionKind,
@@ -270,6 +272,7 @@ fn draw_notifications(
 
 fn notification_matches_search(item: &NotificationItem, filter: &SearchFilter) -> bool {
     let display_title = item.display_title();
+    let merge_direction = item.merge_direction_text();
     let number_alias = item.thread_number().map(|number| number.to_string());
     let hash_alias = item.thread_number().map(|number| format!("#{number}"));
     let repo_number_alias = item
@@ -281,6 +284,15 @@ fn notification_matches_search(item: &NotificationItem, filter: &SearchFilter) -
         display_title.as_str(),
         item.reason.as_str(),
     ];
+    if let Some(head_ref) = item.head_ref.as_deref() {
+        fields.push(head_ref);
+    }
+    if let Some(base_ref) = item.base_ref.as_deref() {
+        fields.push(base_ref);
+    }
+    if let Some(direction) = merge_direction.as_deref() {
+        fields.push(direction);
+    }
     if let Some(url) = item.url.as_deref() {
         fields.push(url);
     }
@@ -330,7 +342,9 @@ fn draw_notification_cards(
 
                 let display_title = item.display_title();
                 if let Some(url) = &item.url {
-                    let resp = column.hyperlink_to(
+                    let resp = render_notification_title_link(
+                        column,
+                        item,
                         notification_text(column, display_title.as_str(), visual),
                         url,
                     );
@@ -338,12 +352,17 @@ fn draw_notification_cards(
                         actions.push(AccountAction::Seen(item.thread_id.clone()));
                     }
                 } else {
-                    let resp =
-                        column.label(notification_text(column, display_title.as_str(), visual));
+                    let resp = render_notification_title_label(
+                        column,
+                        item,
+                        notification_text(column, display_title.as_str(), visual),
+                    );
                     if resp.clicked() {
                         actions.push(AccountAction::Seen(item.thread_id.clone()));
                     }
                 }
+
+                render_notification_branch_direction(column, item, visual);
 
                 column.small(notification_text(
                     column,
@@ -473,13 +492,13 @@ fn draw_notification_table(
                                     let subject =
                                         notification_text(row_ui, display_title.as_str(), visual);
                                     if let Some(url) = &item.url {
-                                        let resp = row_ui.hyperlink_to(subject, url);
+                                        let resp = render_notification_title_link(row_ui, item, subject, url);
                                         if resp.clicked() {
                                             actions
                                                 .push(AccountAction::Seen(item.thread_id.clone()));
-                                        }
+                                            }
                                     } else {
-                                        let resp = row_ui.label(subject);
+                                        let resp = render_notification_title_label(row_ui, item, subject);
                                         if resp.clicked() {
                                             actions
                                                 .push(AccountAction::Seen(item.thread_id.clone()));
@@ -496,6 +515,7 @@ fn draw_notification_table(
                                         pending_review_badge(row_ui);
                                     }
                                 });
+                                render_notification_branch_direction(ui, item, visual);
                                 ui.small(notification_text(
                                     ui,
                                     format!("Reason: {}", &item.reason),
@@ -596,10 +616,63 @@ fn draw_notification_table(
     actions
 }
 
+fn notification_has_approved_badge(item: &NotificationItem) -> bool {
+    item.my_review_status == Some(PullRequestReviewerStatus::Approved)
+}
+
+fn render_notification_title_link(
+    ui: &mut egui::Ui,
+    item: &NotificationItem,
+    text: RichText,
+    url: &str,
+) -> egui::Response {
+    let response = ui.hyperlink_to(text, url);
+    if notification_has_approved_badge(item) {
+        ui.small(
+            RichText::new("✓")
+                .strong()
+                .color(APPROVED_TITLE_CHECK_COLOR),
+        )
+        .on_hover_text("You approved this pull request.");
+    }
+    response
+}
+
+fn render_notification_title_label(
+    ui: &mut egui::Ui,
+    item: &NotificationItem,
+    text: RichText,
+) -> egui::Response {
+    let response = ui.label(text);
+    if notification_has_approved_badge(item) {
+        ui.small(
+            RichText::new("✓")
+                .strong()
+                .color(APPROVED_TITLE_CHECK_COLOR),
+        )
+        .on_hover_text("You approved this pull request.");
+    }
+    response
+}
+
+fn render_notification_branch_direction(
+    ui: &mut egui::Ui,
+    item: &NotificationItem,
+    visual: NotificationVisualState,
+) {
+    let Some(direction) = item.merge_direction_text() else {
+        return;
+    };
+    ui.small(notification_text(ui, direction, visual));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::notification_matches_search;
-    use crate::{app::search::SearchFilter, domain::NotificationItem};
+    use super::{notification_has_approved_badge, notification_matches_search};
+    use crate::{
+        app::search::SearchFilter,
+        domain::{NotificationItem, PullRequestReviewerStatus},
+    };
     use chrono::Utc;
 
     fn notification_with_url(url: &str) -> NotificationItem {
@@ -608,6 +681,9 @@ mod tests {
             repo: String::from("acme/repo"),
             title: String::from("Fix search behavior"),
             url: Some(url.to_owned()),
+            head_ref: Some(String::from("feature/search")),
+            base_ref: Some(String::from("main")),
+            my_review_status: None,
             reason: String::from("review_requested"),
             updated_at: Utc::now(),
             last_read_at: None,
@@ -653,5 +729,27 @@ mod tests {
             &item,
             &SearchFilter::new("acme/repo#123")
         ));
+    }
+
+    #[test]
+    fn notification_search_matches_merge_direction() {
+        let item = notification_with_url("https://github.com/acme/repo/pull/123");
+
+        assert!(notification_matches_search(
+            &item,
+            &SearchFilter::new("feature/search -> main")
+        ));
+    }
+
+    #[test]
+    fn approved_badge_only_shows_for_approved_notifications() {
+        let mut item = notification_with_url("https://github.com/acme/repo/pull/123");
+        assert!(!notification_has_approved_badge(&item));
+
+        item.my_review_status = Some(PullRequestReviewerStatus::Commented);
+        assert!(!notification_has_approved_badge(&item));
+
+        item.my_review_status = Some(PullRequestReviewerStatus::Approved);
+        assert!(notification_has_approved_badge(&item));
     }
 }

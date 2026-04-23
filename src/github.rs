@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{
-    GitHubAccount, InboxSnapshot, MentionKind, MentionThread, NotificationItem,
+    GitHubAccount, InboxSnapshot, MentionKind, MentionThread, NotificationItem, PullRequestKey,
     PullRequestReviewer, PullRequestReviewerStatus, PullRequestReviewers, RepoPullRequest,
     RepoPullRequestSnapshot, ReviewRequest, ReviewSummary,
 };
@@ -44,6 +44,36 @@ pub fn fetch_inbox(client: &Client, profile: &GitHubAccount) -> Result<InboxSnap
         recent_reviews,
         fetched_at: Utc::now(),
     })
+}
+
+pub fn fetch_notification_metadata_updates(
+    client: &Client,
+    profile: &GitHubAccount,
+    notifications: &[NotificationItem],
+) -> Result<Vec<NotificationMetadataUpdate>, FetchError> {
+    let mut metadata_cache = BTreeMap::<PullRequestKey, NotificationPullRequestMetadata>::new();
+    let mut updates = Vec::new();
+
+    for item in notifications {
+        let metadata = notification_pull_request_metadata(
+            client,
+            profile,
+            &item.repo,
+            item.url.as_deref(),
+            &mut metadata_cache,
+        )?;
+        if metadata == NotificationPullRequestMetadata::default() {
+            continue;
+        }
+        updates.push(NotificationMetadataUpdate {
+            thread_id: item.thread_id.clone(),
+            head_ref: metadata.head_ref,
+            base_ref: metadata.base_ref,
+            my_review_status: metadata.my_review_status,
+        });
+    }
+
+    Ok(updates)
 }
 
 pub fn mark_notification_done(
@@ -115,18 +145,23 @@ pub fn fetch_repo_pull_requests(
         .error_for_status()?
         .json()?;
 
-    let pull_requests = response
-        .into_iter()
-        .map(|item| RepoPullRequest {
+    let mut pull_requests = Vec::with_capacity(response.len());
+    for item in response {
+        let my_review_status =
+            fetch_latest_review_status_for_user(client, profile, repo, item.number).unwrap_or(None);
+        pull_requests.push(RepoPullRequest {
             repo: repo.to_owned(),
             number: item.number,
             title: item.title,
             url: item.html_url,
+            head_ref: item.head.r#ref,
+            base_ref: item.base.r#ref,
             updated_at: item.updated_at,
             author_login: item.user.map(|user| user.login),
             draft: item.draft,
-        })
-        .collect();
+            my_review_status,
+        });
+    }
 
     Ok(RepoPullRequestSnapshot {
         pull_requests,
@@ -299,20 +334,83 @@ fn fetch_notifications(
             thread_id: item.id,
             repo: item.repository.full_name,
             title: item.subject.title,
-            url: item.subject.url.as_deref().map(|url| {
-                let mut html = url.replace("api.github.com/repos", "github.com");
-                // GitHub API uses `/pulls/` in the notifications subject URL, but the
-                // human-facing page lives at `/pull/`. Normalize so hyperlinks open
-                // the right PR page instead of the list view.
-                html = html.replace("/pulls/", "/pull/");
-                html
-            }),
+            url: item
+                .subject
+                .url
+                .as_deref()
+                .map(normalize_notification_subject_url),
+            head_ref: None,
+            base_ref: None,
+            my_review_status: None,
             reason: item.reason,
             updated_at: item.updated_at,
             last_read_at: item.last_read_at,
             unread: item.unread,
         })
         .collect())
+}
+
+fn normalize_notification_subject_url(url: &str) -> String {
+    let mut html = url.replace("api.github.com/repos", "github.com");
+    html = html.replace("/pulls/", "/pull/");
+    html
+}
+
+fn notification_pull_request_metadata(
+    client: &Client,
+    profile: &GitHubAccount,
+    repo: &str,
+    url: Option<&str>,
+    cache: &mut BTreeMap<PullRequestKey, NotificationPullRequestMetadata>,
+) -> Result<NotificationPullRequestMetadata, FetchError> {
+    let Some(pr_number) = url.and_then(pull_request_number_from_html_url) else {
+        return Ok(NotificationPullRequestMetadata::default());
+    };
+    let key = (repo.to_owned(), pr_number);
+    if let Some(metadata) = cache.get(&key) {
+        return Ok(metadata.clone());
+    }
+
+    let metadata = fetch_notification_pull_request_metadata(client, profile, repo, pr_number)?;
+    cache.insert(key, metadata.clone());
+    Ok(metadata)
+}
+
+fn pull_request_number_from_html_url(url: &str) -> Option<u64> {
+    let (_, suffix) = url.split_once("/pull/")?;
+    suffix.split(['/', '?', '#']).next()?.parse().ok()
+}
+
+fn fetch_notification_pull_request_metadata(
+    client: &Client,
+    profile: &GitHubAccount,
+    repo: &str,
+    pr_number: u64,
+) -> Result<NotificationPullRequestMetadata, FetchError> {
+    let pull_request = fetch_pull_request(client, profile, repo, pr_number)?;
+    Ok(NotificationPullRequestMetadata {
+        head_ref: Some(pull_request.head.r#ref),
+        base_ref: Some(pull_request.base.r#ref),
+        my_review_status: fetch_latest_review_status_for_user(client, profile, repo, pr_number)?,
+    })
+}
+
+fn fetch_pull_request(
+    client: &Client,
+    profile: &GitHubAccount,
+    repo: &str,
+    pr_number: u64,
+) -> Result<PullRequestResponse, FetchError> {
+    let url = format!("{GH_REPOS}/{repo}/pulls/{pr_number}");
+    client
+        .get(url)
+        .header(USER_AGENT, USER_AGENT_HEADER)
+        .header(ACCEPT, "application/vnd.github+json")
+        .bearer_auth(&profile.token)
+        .send()?
+        .error_for_status()?
+        .json()
+        .map_err(FetchError::Http)
 }
 
 fn fetch_review_requests(
@@ -479,6 +577,79 @@ fn latest_submitted_reviews_by_reviewer(
     latest_reviews
 }
 
+fn latest_submitted_review_for_user(
+    reviews: Vec<PullRequestReviewResponse>,
+    reviewer_login: &str,
+) -> Option<PullRequestReviewResponse> {
+    let reviewer_key = reviewer_login.to_ascii_lowercase();
+    let mut latest_review: Option<PullRequestReviewResponse> = None;
+
+    for review in reviews {
+        let Some(user) = review.user.as_ref() else {
+            continue;
+        };
+        if user.login.to_ascii_lowercase() != reviewer_key {
+            continue;
+        }
+        let Some(submitted_at) = review.submitted_at else {
+            continue;
+        };
+        let should_replace = match latest_review.as_ref() {
+            None => true,
+            Some(current) => {
+                let current_submitted_at = current
+                    .submitted_at
+                    .expect("stored submitted review always keeps timestamp");
+                submitted_at > current_submitted_at
+                    || (submitted_at == current_submitted_at && review.id > current.id)
+            }
+        };
+        if should_replace {
+            latest_review = Some(review);
+        }
+    }
+
+    latest_review
+}
+
+fn review_is_stale_after_re_request(
+    review: &PullRequestReviewResponse,
+    latest_request_times: &BTreeMap<String, DateTime<Utc>>,
+    reviewer_login: &str,
+) -> bool {
+    latest_request_times
+        .get(&reviewer_login.to_ascii_lowercase())
+        .is_some_and(|requested_at| {
+            review
+                .submitted_at
+                .is_some_and(|submitted_at| submitted_at < *requested_at)
+        })
+}
+
+fn fetch_latest_review_status_for_user(
+    client: &Client,
+    profile: &GitHubAccount,
+    repo: &str,
+    pr_number: u64,
+) -> Result<Option<PullRequestReviewerStatus>, FetchError> {
+    let latest_review = latest_submitted_review_for_user(
+        fetch_pull_request_reviews(client, profile, repo, pr_number)?,
+        &profile.login,
+    );
+    let Some(review) = latest_review else {
+        return Ok(None);
+    };
+
+    let latest_request_times = latest_review_request_times_from_issue_events(&fetch_issue_events(
+        client, profile, repo, pr_number,
+    )?);
+    if review_is_stale_after_re_request(&review, &latest_request_times, &profile.login) {
+        return Ok(None);
+    }
+
+    Ok(reviewer_status_from_review_state(&review.state))
+}
+
 fn build_current_reviewers(
     requested_reviewers: &[String],
     reviewer_history: &[String],
@@ -619,6 +790,15 @@ fn extract_repo_name(api_url: &str) -> String {
 
 pub type FetchOutcome = Result<InboxSnapshot, FetchError>;
 pub type RepoFetchOutcome = Result<RepoPullRequestSnapshot, FetchError>;
+pub type NotificationMetadataOutcome = Result<Vec<NotificationMetadataUpdate>, FetchError>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotificationMetadataUpdate {
+    pub thread_id: String,
+    pub head_ref: Option<String>,
+    pub base_ref: Option<String>,
+    pub my_review_status: Option<PullRequestReviewerStatus>,
+}
 
 #[derive(Error, Debug)]
 pub enum FetchError {
@@ -659,10 +839,17 @@ struct PullRequestResponse {
     html_url: String,
     number: u64,
     title: String,
+    head: PullRequestBranchRef,
+    base: PullRequestBranchRef,
     updated_at: DateTime<Utc>,
     user: Option<GitHubUser>,
     #[serde(default)]
     draft: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestBranchRef {
+    r#ref: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -695,6 +882,13 @@ struct SubmittedReviewState {
     review_id: u64,
     submitted_at: DateTime<Utc>,
     status: PullRequestReviewerStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NotificationPullRequestMetadata {
+    head_ref: Option<String>,
+    base_ref: Option<String>,
+    my_review_status: Option<PullRequestReviewerStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -910,6 +1104,84 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn latest_submitted_review_for_user_tracks_latest_submitted_state() {
+        let reviews = vec![
+            PullRequestReviewResponse {
+                id: 1,
+                state: String::from("COMMENTED"),
+                user: Some(GitHubUser {
+                    login: String::from("neo"),
+                }),
+                submitted_at: Some("2026-04-01T00:00:00Z".parse().unwrap()),
+            },
+            PullRequestReviewResponse {
+                id: 2,
+                state: String::from("APPROVED"),
+                user: Some(GitHubUser {
+                    login: String::from("neo"),
+                }),
+                submitted_at: Some("2026-04-02T00:00:00Z".parse().unwrap()),
+            },
+        ];
+
+        let review = latest_submitted_review_for_user(reviews, "neo").expect("review");
+
+        assert_eq!(
+            reviewer_status_from_review_state(&review.state),
+            Some(PullRequestReviewerStatus::Approved)
+        );
+    }
+
+    #[test]
+    fn latest_submitted_review_for_user_clears_older_approval_after_unmapped_state() {
+        let reviews = vec![
+            PullRequestReviewResponse {
+                id: 1,
+                state: String::from("APPROVED"),
+                user: Some(GitHubUser {
+                    login: String::from("neo"),
+                }),
+                submitted_at: Some("2026-04-01T00:00:00Z".parse().unwrap()),
+            },
+            PullRequestReviewResponse {
+                id: 2,
+                state: String::from("DISMISSED"),
+                user: Some(GitHubUser {
+                    login: String::from("neo"),
+                }),
+                submitted_at: Some("2026-04-02T00:00:00Z".parse().unwrap()),
+            },
+        ];
+
+        let review = latest_submitted_review_for_user(reviews, "neo").expect("review");
+
+        assert_eq!(reviewer_status_from_review_state(&review.state), None);
+    }
+
+    #[test]
+    fn review_is_stale_after_re_request_ignores_stale_approval() {
+        let reviews = vec![PullRequestReviewResponse {
+            id: 1,
+            state: String::from("APPROVED"),
+            user: Some(GitHubUser {
+                login: String::from("neo"),
+            }),
+            submitted_at: Some("2026-04-01T00:00:00Z".parse().unwrap()),
+        }];
+        let latest_request_times = BTreeMap::from([(
+            String::from("neo"),
+            "2026-04-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        )]);
+        let latest_review = latest_submitted_review_for_user(reviews, "neo").expect("review");
+
+        assert!(review_is_stale_after_re_request(
+            &latest_review,
+            &latest_request_times,
+            "neo"
+        ));
     }
 
     #[test]

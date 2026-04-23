@@ -8,7 +8,7 @@ use std::{
 use chrono::Utc;
 
 use crate::{
-    domain::{GitHubAccount, InboxSnapshot, PullRequestReviewers},
+    domain::{GitHubAccount, InboxSnapshot, NotificationItem, PullRequestReviewers},
     github::{self, FetchError},
 };
 
@@ -16,8 +16,9 @@ use super::{
     AccountViewMode, ReviewRequestEditor, SectionKind,
     notification_state::{collect_new_notification_ids, section_stats},
     review::{
-        ReviewJob, ReviewJobMessage, ReviewLaunchPlan, ReviewOutputState, ReviewStatus,
-        append_review_chunk, append_review_follow_up_prompt, initial_review_output_state,
+        ReviewJob, ReviewJobMessage, ReviewLaunchPlan, ReviewOutputState, ReviewServer,
+        ReviewServerHealth, ReviewStatus, append_review_chunk, append_review_follow_up_prompt,
+        initial_review_output_state, review_process_active, review_session_ready,
     },
 };
 
@@ -28,8 +29,10 @@ pub(super) struct AccountState {
     pub(super) review_outputs: BTreeMap<String, ReviewOutputState>,
     pub(super) last_error: Option<String>,
     pub(super) pending_job: Option<PendingJob>,
+    pending_notification_metadata_job: Option<PendingNotificationMetadataJob>,
     pending_actions: Vec<NotificationActionJob>,
     pending_review_jobs: BTreeMap<String, ReviewJob>,
+    review_servers: BTreeMap<String, ReviewServer>,
     pub(super) review_request_editor: Option<ReviewRequestEditor>,
     pending_review_request_load: Option<ReviewRequestLoadJob>,
     pending_review_request_action: Option<ReviewRequestActionJob>,
@@ -49,8 +52,10 @@ impl AccountState {
             review_outputs: BTreeMap::new(),
             last_error: None,
             pending_job: None,
+            pending_notification_metadata_job: None,
             pending_actions: Vec::new(),
             pending_review_jobs: BTreeMap::new(),
+            review_servers: BTreeMap::new(),
             review_request_editor: None,
             pending_review_request_load: None,
             pending_review_request_action: None,
@@ -65,6 +70,7 @@ impl AccountState {
     pub(super) fn start_refresh(&mut self) {
         let profile = self.profile.clone();
         self.last_error = None;
+        self.pending_notification_metadata_job = None;
         self.pending_job = Some(PendingJob::spawn(profile));
     }
 
@@ -106,11 +112,42 @@ impl AccountState {
                     }
 
                     self.inbox = Some(inbox);
+                    self.start_notification_metadata_refresh();
                     self.last_error = None;
                 }
                 Err(err) => {
                     self.last_error = Some(err.to_string());
                 }
+            }
+        }
+    }
+
+    pub(super) fn poll_notification_metadata_job(&mut self) {
+        if let Some(job) = &self.pending_notification_metadata_job
+            && let Some(result) = job.try_take()
+        {
+            self.pending_notification_metadata_job = None;
+            let Ok(updates) = result else {
+                return;
+            };
+            let Some(inbox) = &mut self.inbox else {
+                return;
+            };
+
+            let updates_by_thread: BTreeMap<_, _> = updates
+                .into_iter()
+                .map(|update| {
+                    let thread_id = update.thread_id.clone();
+                    (thread_id, update)
+                })
+                .collect();
+            for item in &mut inbox.notifications {
+                let Some(update) = updates_by_thread.get(&item.thread_id) else {
+                    continue;
+                };
+                item.head_ref = update.head_ref.clone();
+                item.base_ref = update.base_ref.clone();
+                item.my_review_status = update.my_review_status;
             }
         }
     }
@@ -128,6 +165,9 @@ impl AccountState {
 
         for message in messages {
             match message {
+                ReviewJobMessage::ServerReady { thread_id, server } => {
+                    self.review_servers.insert(thread_id, server);
+                }
                 ReviewJobMessage::Append { thread_id, bytes } => {
                     if let Some(review_output) = self.review_outputs.get_mut(&thread_id) {
                         if let Some(prompt) = review_output.pending_follow_up_prompt.take() {
@@ -142,12 +182,16 @@ impl AccountState {
                     captured_at,
                     session_id,
                 } => {
+                    let session_ready = session_id.is_some();
                     if let Some(review_output) = self.review_outputs.get_mut(&thread_id) {
-                        review_output.status = ReviewStatus::Completed;
+                        review_output.status = ReviewStatus::Running;
                         review_output.captured_at = Some(captured_at);
-                        if session_id.is_some() {
+                        if session_ready {
                             review_output.session_id = session_id;
                         }
+                    }
+                    if !session_ready {
+                        self.review_servers.remove(&thread_id);
                     }
                     self.inflight_done.remove(&thread_id);
                 }
@@ -157,13 +201,15 @@ impl AccountState {
                     session_id,
                     _message: _,
                 } => {
+                    let session_ready = session_id.is_some();
                     if let Some(review_output) = self.review_outputs.get_mut(&thread_id) {
                         review_output.status = ReviewStatus::Cancelled;
                         review_output.captured_at = Some(captured_at);
-                        if session_id.is_some() {
+                        if session_ready {
                             review_output.session_id = session_id;
                         }
                     }
+                    self.review_servers.remove(&thread_id);
                     self.inflight_done.remove(&thread_id);
                 }
                 ReviewJobMessage::FinishedFailure {
@@ -172,14 +218,16 @@ impl AccountState {
                     session_id,
                     message,
                 } => {
+                    let session_ready = session_id.is_some();
                     self.last_error = Some(message.clone());
                     if let Some(review_output) = self.review_outputs.get_mut(&thread_id) {
                         review_output.status = ReviewStatus::Failed;
                         review_output.captured_at = Some(captured_at);
-                        if session_id.is_some() {
+                        if session_ready {
                             review_output.session_id = session_id;
                         }
                     }
+                    self.review_servers.remove(&thread_id);
                     self.inflight_done.remove(&thread_id);
                 }
             }
@@ -333,12 +381,13 @@ impl AccountState {
         if self.inflight_done.contains(&thread_id) {
             return;
         }
+
         self.last_error = None;
         self.review_outputs.insert(
             thread_id.clone(),
             initial_review_output_state(thread_id.clone(), &launch),
         );
-        let job = ReviewJob::spawn(thread_id.clone(), launch, self.profile.token.clone());
+        let job = ReviewJob::spawn(thread_id.clone(), launch, self.profile.token.clone(), None);
         self.pending_review_jobs.insert(thread_id.clone(), job);
         self.inflight_done.insert(thread_id);
     }
@@ -358,15 +407,13 @@ impl AccountState {
             || self
                 .review_outputs
                 .get(thread_id)
-                .is_some_and(|review_output| review_output.status == ReviewStatus::Running)
+                .is_some_and(review_process_active)
     }
 
     pub(super) fn can_send_review_follow_up(&self, thread_id: &str) -> bool {
         self.review_outputs
             .get(thread_id)
-            .is_some_and(|review_output| {
-                !self.review_is_running(thread_id) && review_output.session_id.is_some()
-            })
+            .is_some_and(review_session_ready)
     }
 
     pub(super) fn request_review_follow_up(&mut self, thread_id: &str) {
@@ -388,6 +435,40 @@ impl AccountState {
             }
             return;
         }
+
+        let attach_url = match self.review_servers.get_mut(thread_id) {
+            Some(server) => match server.health_status() {
+                ReviewServerHealth::Healthy => server.url().to_owned(),
+                ReviewServerHealth::Unhealthy => {
+                    if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
+                        review_output.follow_up_error = Some(
+                            "The review backend is still starting or temporarily unavailable. Try again in a moment."
+                                .to_owned(),
+                        );
+                    }
+                    return;
+                }
+                ReviewServerHealth::Exited => {
+                    self.review_servers.remove(thread_id);
+                    if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
+                        review_output.follow_up_error = Some(
+                            "This review backend is no longer available. Start a new review to continue."
+                                .to_owned(),
+                        );
+                    }
+                    return;
+                }
+            },
+            None => {
+                if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
+                    review_output.follow_up_error = Some(
+                        "This review backend is no longer available. Start a new review to continue."
+                            .to_owned(),
+                    );
+                }
+                return;
+            }
+        };
 
         let Some(review_output) = self.review_outputs.get_mut(thread_id) else {
             return;
@@ -420,7 +501,12 @@ impl AccountState {
             String::from(review_output.output_kind.follow_up_command_label());
         review_output.pending_follow_up_prompt = Some(prompt);
 
-        let job = ReviewJob::spawn(thread_id.to_owned(), launch, self.profile.token.clone());
+        let job = ReviewJob::spawn(
+            thread_id.to_owned(),
+            launch,
+            self.profile.token.clone(),
+            Some(attach_url),
+        );
         self.pending_review_jobs.insert(thread_id.to_owned(), job);
         self.inflight_done.insert(thread_id.to_owned());
     }
@@ -446,7 +532,7 @@ impl AccountState {
     pub(super) fn active_review_thread_ids(&self) -> HashSet<String> {
         self.review_outputs
             .values()
-            .filter(|review_output| review_output.status == ReviewStatus::Running)
+            .filter(|review_output| review_process_active(review_output))
             .map(|review_output| review_output.thread_id.clone())
             .collect()
     }
@@ -606,10 +692,35 @@ impl AccountState {
             reviewer_login,
         ))
     }
+
+    fn start_notification_metadata_refresh(&mut self) {
+        let Some(inbox) = &self.inbox else {
+            self.pending_notification_metadata_job = None;
+            return;
+        };
+        let notifications: Vec<NotificationItem> = inbox
+            .notifications
+            .iter()
+            .filter(|item| item.pull_request_url().is_some())
+            .cloned()
+            .collect();
+        if notifications.is_empty() {
+            self.pending_notification_metadata_job = None;
+            return;
+        }
+        self.pending_notification_metadata_job = Some(PendingNotificationMetadataJob::spawn(
+            self.profile.clone(),
+            notifications,
+        ));
+    }
 }
 
 pub(super) struct PendingJob {
     receiver: Receiver<github::FetchOutcome>,
+}
+
+struct PendingNotificationMetadataJob {
+    receiver: Receiver<github::NotificationMetadataOutcome>,
 }
 
 impl PendingJob {
@@ -626,6 +737,28 @@ impl PendingJob {
     }
 
     fn try_take(&self) -> Option<github::FetchOutcome> {
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(FetchError::BackgroundWorkerGone)),
+        }
+    }
+}
+
+impl PendingNotificationMetadataJob {
+    fn spawn(profile: GitHubAccount, notifications: Vec<NotificationItem>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = (|| -> github::NotificationMetadataOutcome {
+                let client = github::build_client()?;
+                github::fetch_notification_metadata_updates(&client, &profile, &notifications)
+            })();
+            let _ = tx.send(outcome);
+        });
+        Self { receiver: rx }
+    }
+
+    fn try_take(&self) -> Option<github::NotificationMetadataOutcome> {
         match self.receiver.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => None,
@@ -864,11 +997,13 @@ impl NotificationActionJob {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+
     use super::AccountState;
     use crate::{
         app::review::{
             ReviewLaunchPlan, ReviewStatus, append_review_chunk, append_review_follow_up_prompt,
-            initial_review_output_state,
+            initial_review_output_state, test_review_server,
         },
         domain::{GitHubAccount, ReviewCommandSettings},
     };
@@ -895,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn can_send_review_follow_up_requires_finished_review_with_session_id() {
+    fn can_send_review_follow_up_requires_completed_review_session_with_session_id() {
         let mut account = account_state();
         let review_output = sample_review_output();
 
@@ -905,17 +1040,35 @@ mod tests {
         assert!(!account.can_send_review_follow_up("thread-1"));
 
         let mut review_output = sample_review_output();
-        review_output.status = ReviewStatus::Completed;
+        review_output.captured_at = Some(Utc::now());
         review_output.session_id = Some(String::from("ses_123"));
         account
             .review_outputs
             .insert(String::from("thread-1"), review_output);
 
         assert!(account.can_send_review_follow_up("thread-1"));
+
+        let mut review_output = sample_review_output();
+        review_output.status = ReviewStatus::Cancelled;
+        review_output.session_id = Some(String::from("ses_123"));
+        account
+            .review_outputs
+            .insert(String::from("thread-2"), review_output);
+
+        assert!(!account.can_send_review_follow_up("thread-2"));
+
+        let mut review_output = sample_review_output();
+        review_output.status = ReviewStatus::Failed;
+        review_output.session_id = Some(String::from("ses_123"));
+        account
+            .review_outputs
+            .insert(String::from("thread-3"), review_output);
+
+        assert!(!account.can_send_review_follow_up("thread-3"));
     }
 
     #[test]
-    fn review_is_running_checks_pending_jobs_and_status() {
+    fn review_is_running_checks_live_run_state() {
         let mut account = account_state();
         let review_output = sample_review_output();
 
@@ -926,7 +1079,7 @@ mod tests {
         assert!(account.review_is_running("thread-1"));
 
         if let Some(review_output) = account.review_outputs.get_mut("thread-1") {
-            review_output.status = ReviewStatus::Completed;
+            review_output.captured_at = Some(Utc::now());
         }
 
         assert!(!account.review_is_running("thread-1"));
@@ -936,12 +1089,16 @@ mod tests {
     fn request_review_follow_up_keeps_draft_until_output_arrives() {
         let mut account = account_state();
         let mut review_output = sample_review_output();
-        review_output.status = ReviewStatus::Completed;
+        review_output.captured_at = Some(Utc::now());
         review_output.session_id = Some(String::from("ses_123"));
         review_output.follow_up_draft = String::from("Explain the main issue");
         account
             .review_outputs
             .insert(String::from("thread-1"), review_output);
+        account.review_servers.insert(
+            String::from("thread-1"),
+            test_review_server("test://review-thread-1"),
+        );
 
         account.request_review_follow_up("thread-1");
 

@@ -1,9 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env,
     fs::OpenOptions,
     io::{BufReader, ErrorKind, IsTerminal, Read, Write},
     mem,
+    net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -12,6 +13,7 @@ use std::{
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -19,6 +21,7 @@ use eframe::egui::{
     self, Color32, Context, FontId, Stroke,
     text::{LayoutJob, TextFormat},
 };
+use reqwest::blocking::Client;
 use serde_json::Value;
 use vt100::Parser as TerminalParser;
 
@@ -37,6 +40,15 @@ const GITHUB_TOKEN_ENV_VAR: &str = "GITHUB_TOKEN";
 const REVIEW_TEXT_SIZE: f32 = 13.0;
 const REVIEW_TERMINAL_ROWS: u16 = 1000;
 const REVIEW_TERMINAL_COLS: u16 = 240;
+const OPENCODE_SERVER_HOST: &str = "127.0.0.1";
+const OPENCODE_SERVER_HEALTH_PATH: &str = "/global/health";
+const OPENCODE_SERVER_STARTUP_RETRIES: usize = 50;
+const OPENCODE_SERVER_STARTUP_DELAY_MS: u64 = 100;
+const OPENCODE_SERVER_HEALTH_TIMEOUT_MS: u64 = 250;
+const OPENCODE_SERVER_API_TIMEOUT_MS: u64 = 2_000;
+const REVIEW_SESSION_SETTLE_POLL_MS: u64 = 500;
+const REVIEW_SESSION_SETTLE_IDLE_GRACE_MS: u64 = 1_500;
+const REVIEW_SESSION_SETTLE_TIMEOUT_MS: u64 = 600_000;
 
 static SHELL_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -90,6 +102,17 @@ pub(super) struct ReviewOutputState {
     pub(super) dropped_chars: usize,
 }
 
+pub(super) struct ReviewServer {
+    url: String,
+    child: Child,
+}
+
+pub(super) enum ReviewServerHealth {
+    Healthy,
+    Unhealthy,
+    Exited,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReviewStyledSpan {
     text: String,
@@ -126,12 +149,15 @@ struct ReviewAnsiParserState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReviewStatus {
     Running,
-    Completed,
     Cancelled,
     Failed,
 }
 
 pub(super) enum ReviewJobMessage {
+    ServerReady {
+        thread_id: String,
+        server: ReviewServer,
+    },
     Append {
         thread_id: String,
         bytes: Vec<u8>,
@@ -180,8 +206,8 @@ struct ReviewRunFailure {
 #[derive(Default)]
 struct ReviewCommandCapture {
     output: String,
-    saw_text_response: bool,
     session_id: Option<String>,
+    seen_part_ids: HashSet<String>,
 }
 
 enum ReviewShellDestination {
@@ -198,8 +224,93 @@ struct ReviewRunContext<'a> {
     tx: &'a mpsc::Sender<ReviewJobMessage>,
     thread_id: &'a str,
     review_label: &'a str,
+    attach_url: &'a str,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
+}
+
+impl Drop for ReviewServer {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+}
+
+impl ReviewServer {
+    pub(super) fn start(
+        repo_path: &str,
+        review_settings: &ReviewCommandSettings,
+        github_token: &str,
+    ) -> Result<Self, String> {
+        let port = reserve_local_port()?;
+        let url = format!("http://{OPENCODE_SERVER_HOST}:{port}");
+        let mut command = Command::new("opencode");
+        command.current_dir(repo_path);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        command.envs(review_command_envs(review_settings, github_token));
+        command.arg("serve");
+        command.arg("--hostname");
+        command.arg(OPENCODE_SERVER_HOST);
+        command.arg("--port");
+        command.arg(port.to_string());
+
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("Failed to start opencode serve: {err}"))?;
+        if let Err(err) = wait_for_review_server(&url, &mut child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+
+        Ok(Self { url, child })
+    }
+
+    pub(super) fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub(super) fn health_status(&mut self) -> ReviewServerHealth {
+        #[cfg(test)]
+        if self.url.starts_with("test://") {
+            return ReviewServerHealth::Healthy;
+        }
+
+        match self.child.try_wait() {
+            Ok(Some(_)) | Err(_) => ReviewServerHealth::Exited,
+            Ok(None) => {
+                if review_server_healthy(&self.url) {
+                    ReviewServerHealth::Healthy
+                } else {
+                    ReviewServerHealth::Unhealthy
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_review_server(url: &str) -> ReviewServer {
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("test review server child should spawn");
+
+    ReviewServer {
+        url: url.to_owned(),
+        child,
+    }
 }
 
 impl ReviewShellMirror {
@@ -425,6 +536,10 @@ fn review_event_session_id(event: &Value) -> Option<&str> {
         .or_else(|| review_json_string_at(event, &["part", "sessionID"]))
 }
 
+fn review_event_part_id(event: &Value) -> Option<&str> {
+    review_json_string_at(event, &["part", "id"])
+}
+
 fn format_review_tool_event(part: &Value) -> Option<String> {
     let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
     let title = review_json_string_at(part, &["state", "title"])
@@ -442,20 +557,37 @@ fn format_review_tool_event(part: &Value) -> Option<String> {
     }
 }
 
-fn render_review_json_event(event: &Value, capture: &mut ReviewCommandCapture) -> Option<String> {
+fn render_review_part(part: &Value) -> Option<String> {
+    let part_type = part.get("type")?.as_str()?;
+
+    match part_type {
+        "text" => {
+            let text = review_json_string_at(part, &["text"])?;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            Some(format!("{trimmed}\n\n"))
+        }
+        "tool" => format_review_tool_event(part),
+        _ => None,
+    }
+}
+
+fn render_review_json_event(event: &Value) -> Option<String> {
     let event_type = event.get("type")?.as_str()?;
 
     match event_type {
-        "text" => {
+        "text" => event.get("part").and_then(render_review_part).or_else(|| {
             let text = review_json_string_at(event, &["part", "text"])?;
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 return None;
             }
-            capture.saw_text_response = true;
             Some(format!("{trimmed}\n\n"))
-        }
+        }),
         "tool_use" => event.get("part").and_then(format_review_tool_event),
+        "reasoning" | "step_start" | "step_finish" => None,
         "error" => {
             let message = review_json_string_at(event, &["error", "data", "message"])
                 .or_else(|| review_json_string_at(event, &["error", "message"]))
@@ -463,6 +595,187 @@ fn render_review_json_event(event: &Value, capture: &mut ReviewCommandCapture) -
             Some(format!("[Error] {}\n\n", message.trim()))
         }
         _ => None,
+    }
+}
+
+fn review_server_api_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(Duration::from_millis(OPENCODE_SERVER_API_TIMEOUT_MS))
+        .build()
+        .map_err(|err| format!("Failed to build opencode server API client: {err}"))
+}
+
+fn read_review_server_json(client: &Client, url: &str) -> Result<Value, String> {
+    client
+        .get(url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|err| format!("Failed to query opencode server at {url}: {err}"))?
+        .json::<Value>()
+        .map_err(|err| format!("Failed to decode opencode server response from {url}: {err}"))
+}
+
+fn review_session_messages_url(attach_url: &str, session_id: &str) -> String {
+    format!("{attach_url}/session/{session_id}/message")
+}
+
+fn review_session_children_url(attach_url: &str, session_id: &str) -> String {
+    format!("{attach_url}/session/{session_id}/children")
+}
+
+fn review_session_status_url(attach_url: &str) -> String {
+    format!("{attach_url}/session/status")
+}
+
+fn collect_review_session_tree_ids(
+    client: &Client,
+    attach_url: &str,
+    session_id: &str,
+) -> Result<HashSet<String>, String> {
+    let mut pending = vec![session_id.to_owned()];
+    let mut session_ids = HashSet::new();
+
+    while let Some(current_id) = pending.pop() {
+        if !session_ids.insert(current_id.clone()) {
+            continue;
+        }
+
+        let response = read_review_server_json(
+            client,
+            &review_session_children_url(attach_url, &current_id),
+        )?;
+        let Some(children) = response.as_array() else {
+            continue;
+        };
+
+        for child in children {
+            if let Some(child_id) = child.get("id").and_then(Value::as_str) {
+                pending.push(child_id.to_owned());
+            }
+        }
+    }
+
+    Ok(session_ids)
+}
+
+fn append_late_review_session_output(
+    capture: &mut ReviewCommandCapture,
+    shell_mirror: &Arc<Mutex<Option<ReviewShellMirror>>>,
+    tx: &mpsc::Sender<ReviewJobMessage>,
+    thread_id: &str,
+    client: &Client,
+    attach_url: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    let response =
+        read_review_server_json(client, &review_session_messages_url(attach_url, session_id))?;
+    let Some(messages) = response.as_array() else {
+        return Ok(false);
+    };
+
+    let mut appended = false;
+
+    for message in messages {
+        if message
+            .get("info")
+            .and_then(|info| info.get("role"))
+            .and_then(Value::as_str)
+            != Some("assistant")
+        {
+            continue;
+        }
+
+        let Some(parts) = message.get("parts").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for part in parts {
+            let Some(part_id) = part.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !capture.seen_part_ids.insert(part_id.to_owned()) {
+                continue;
+            }
+
+            if let Some(rendered) = render_review_part(part) {
+                append_rendered_review_output(capture, shell_mirror, tx, thread_id, &rendered);
+                appended = true;
+            }
+        }
+    }
+
+    Ok(appended)
+}
+
+fn review_sessions_all_idle(statuses: &Value, session_ids: &HashSet<String>) -> bool {
+    session_ids.iter().all(|session_id| {
+        statuses
+            .get(session_id)
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str)
+            == Some("idle")
+    })
+}
+
+fn wait_for_review_session_settle(
+    capture: &mut ReviewCommandCapture,
+    shell_mirror: &Arc<Mutex<Option<ReviewShellMirror>>>,
+    tx: &mpsc::Sender<ReviewJobMessage>,
+    thread_id: &str,
+    attach_url: &str,
+    session_id: &str,
+    cancel_requested: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let client = review_server_api_client()?;
+    let deadline = Instant::now() + Duration::from_millis(REVIEW_SESSION_SETTLE_TIMEOUT_MS);
+    let mut idle_since: Option<Instant> = None;
+
+    loop {
+        if cancel_requested.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let appended = append_late_review_session_output(
+            capture,
+            shell_mirror,
+            tx,
+            thread_id,
+            &client,
+            attach_url,
+            session_id,
+        )?;
+        let session_ids = collect_review_session_tree_ids(&client, attach_url, session_id)?;
+        let statuses = read_review_server_json(&client, &review_session_status_url(attach_url))?;
+        let now = Instant::now();
+
+        if appended {
+            idle_since = None;
+        } else if review_sessions_all_idle(&statuses, &session_ids) {
+            if let Some(started_idle_at) = idle_since {
+                if now.duration_since(started_idle_at)
+                    >= Duration::from_millis(REVIEW_SESSION_SETTLE_IDLE_GRACE_MS)
+                {
+                    return Ok(());
+                }
+            } else {
+                idle_since = Some(now);
+            }
+        } else {
+            idle_since = None;
+        }
+
+        if now >= deadline {
+            append_rendered_review_output(
+                capture,
+                shell_mirror,
+                tx,
+                thread_id,
+                "\n[reminder] review output is still settling in opencode; more activity may continue there.\n\n",
+            );
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_millis(REVIEW_SESSION_SETTLE_POLL_MS));
     }
 }
 
@@ -786,7 +1099,12 @@ pub(super) fn review_output_plain_text(review_output: &ReviewOutputState) -> Str
 }
 
 impl ReviewJob {
-    pub(super) fn spawn(thread_id: String, launch: ReviewLaunchPlan, github_token: String) -> Self {
+    pub(super) fn spawn(
+        thread_id: String,
+        launch: ReviewLaunchPlan,
+        github_token: String,
+        attach_url: Option<String>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let worker_thread_id = thread_id.clone();
         let child = Arc::new(Mutex::new(None));
@@ -794,11 +1112,52 @@ impl ReviewJob {
         let worker_child = Arc::clone(&child);
         let worker_cancel_requested = Arc::clone(&cancel_requested);
         thread::spawn(move || {
+            let attach_url = match attach_url {
+                Some(attach_url) => attach_url,
+                None => {
+                    let server = match review_server_for_launch(&launch, &github_token) {
+                        Ok(server) => server,
+                        Err(message) => {
+                            let _ = tx.send(ReviewJobMessage::FinishedFailure {
+                                thread_id: worker_thread_id.clone(),
+                                captured_at: Utc::now(),
+                                session_id: None,
+                                message,
+                            });
+                            return;
+                        }
+                    };
+
+                    if worker_cancel_requested.load(Ordering::SeqCst) {
+                        let _ = tx.send(ReviewJobMessage::FinishedCancelled {
+                            thread_id: worker_thread_id.clone(),
+                            captured_at: Utc::now(),
+                            session_id: None,
+                            _message: "Review canceled by user.".to_owned(),
+                        });
+                        return;
+                    }
+
+                    let attach_url = server.url().to_owned();
+                    if tx
+                        .send(ReviewJobMessage::ServerReady {
+                            thread_id: worker_thread_id.clone(),
+                            server,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    attach_url
+                }
+            };
+
             let outcome = run_review_stream(
                 &tx,
                 &worker_thread_id,
                 &launch,
                 &github_token,
+                &attach_url,
                 worker_child,
                 worker_cancel_requested,
             );
@@ -946,6 +1305,7 @@ fn run_review_stream(
     thread_id: &str,
     launch: &ReviewLaunchPlan,
     github_token: &str,
+    attach_url: &str,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
@@ -954,6 +1314,7 @@ fn run_review_stream(
         tx,
         thread_id,
         review_label: &review_label,
+        attach_url,
         child_handle,
         cancel_requested,
     };
@@ -1018,6 +1379,8 @@ fn run_custom_review(
     command.stderr(Stdio::piped());
     command.envs(review_command_envs(review_settings, github_token));
     command.arg("run");
+    command.arg("--attach");
+    command.arg(context.attach_url);
     command.arg("--dir");
     command.arg(repo_path);
     command.arg("--format");
@@ -1032,6 +1395,7 @@ fn run_custom_review(
         context.tx,
         context.thread_id,
         context.review_label,
+        context.attach_url,
         command,
         context.child_handle,
         context.cancel_requested,
@@ -1052,6 +1416,8 @@ fn run_pr_description(
     command.stderr(Stdio::piped());
     command.envs(review_command_envs(review_settings, github_token));
     command.arg("run");
+    command.arg("--attach");
+    command.arg(context.attach_url);
     command.arg("--dir");
     command.arg(repo_path);
     command.arg("--format");
@@ -1069,6 +1435,7 @@ fn run_pr_description(
         context.tx,
         context.thread_id,
         context.review_label,
+        context.attach_url,
         command,
         context.child_handle,
         context.cancel_requested,
@@ -1089,6 +1456,8 @@ fn run_review_follow_up(
     command.stderr(Stdio::piped());
     command.envs(review_command_envs(review_settings, github_token));
     command.arg("run");
+    command.arg("--attach");
+    command.arg(context.attach_url);
     command.arg("--dir");
     command.arg(repo_path);
     command.arg("--format");
@@ -1105,6 +1474,7 @@ fn run_review_follow_up(
         context.tx,
         context.thread_id,
         context.review_label,
+        context.attach_url,
         command,
         context.child_handle,
         context.cancel_requested,
@@ -1176,31 +1546,39 @@ fn read_review_json_stream(
                 continue;
             }
 
-            let rendered = serde_json::from_str::<Value>(trimmed)
-                .ok()
-                .and_then(|event| {
-                    if capture.session_id.is_none() {
-                        capture.session_id = review_event_session_id(&event).map(str::to_owned);
-                    }
-                    render_review_json_event(&event, &mut capture)
-                })
-                .unwrap_or_else(|| format!("{trimmed}\n"));
-            append_rendered_review_output(&mut capture, shell_mirror, tx, thread_id, &rendered);
+            let rendered = if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+                if capture.session_id.is_none() {
+                    capture.session_id = review_event_session_id(&event).map(str::to_owned);
+                }
+                if let Some(part_id) = review_event_part_id(&event) {
+                    capture.seen_part_ids.insert(part_id.to_owned());
+                }
+                render_review_json_event(&event)
+            } else {
+                Some(format!("{trimmed}\n"))
+            };
+            if let Some(rendered) = rendered {
+                append_rendered_review_output(&mut capture, shell_mirror, tx, thread_id, &rendered);
+            }
         }
     }
 
     let trailing = pending.trim();
     if !trailing.is_empty() {
-        let rendered = serde_json::from_str::<Value>(trailing)
-            .ok()
-            .and_then(|event| {
-                if capture.session_id.is_none() {
-                    capture.session_id = review_event_session_id(&event).map(str::to_owned);
-                }
-                render_review_json_event(&event, &mut capture)
-            })
-            .unwrap_or_else(|| format!("{trailing}\n"));
-        append_rendered_review_output(&mut capture, shell_mirror, tx, thread_id, &rendered);
+        let rendered = if let Ok(event) = serde_json::from_str::<Value>(trailing) {
+            if capture.session_id.is_none() {
+                capture.session_id = review_event_session_id(&event).map(str::to_owned);
+            }
+            if let Some(part_id) = review_event_part_id(&event) {
+                capture.seen_part_ids.insert(part_id.to_owned());
+            }
+            render_review_json_event(&event)
+        } else {
+            Some(format!("{trailing}\n"))
+        };
+        if let Some(rendered) = rendered {
+            append_rendered_review_output(&mut capture, shell_mirror, tx, thread_id, &rendered);
+        }
     }
 
     Ok(capture)
@@ -1210,6 +1588,7 @@ fn stream_review_command(
     tx: &mpsc::Sender<ReviewJobMessage>,
     thread_id: &str,
     review_label: &str,
+    attach_url: &str,
     mut command: Command,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
@@ -1301,7 +1680,7 @@ fn stream_review_command(
         )
     });
 
-    let stdout_capture = read_review_json_stream(
+    let mut stdout_capture = read_review_json_stream(
         tx,
         thread_id,
         stdout,
@@ -1372,14 +1751,22 @@ fn stream_review_command(
     }
 
     if status.success() {
-        if !stdout_capture.saw_text_response {
-            finish_review_shell_stream(&shell_mirror, tx, thread_id, "incomplete");
-            return Err(ReviewRunFailure {
-                message: format_review_incomplete_output(&stdout_capture.output, &stderr_capture),
-                session_id: stdout_capture.session_id,
-            });
+        if let Some(session_id) = stdout_capture.session_id.clone() {
+            wait_for_review_session_settle(
+                &mut stdout_capture,
+                &shell_mirror,
+                tx,
+                thread_id,
+                attach_url,
+                &session_id,
+                &cancel_requested,
+            )
+            .map_err(|message| ReviewRunFailure {
+                message,
+                session_id: Some(session_id),
+            })?;
         }
-        finish_review_shell_stream(&shell_mirror, tx, thread_id, "completed");
+        finish_review_shell_stream(&shell_mirror, tx, thread_id, "session ready");
         return Ok(ReviewRunOutcome::Completed {
             session_id: stdout_capture.session_id,
         });
@@ -1397,21 +1784,6 @@ fn stream_review_command(
     })
 }
 
-fn format_review_incomplete_output(stdout: &str, stderr: &str) -> String {
-    let stdout = stdout.trim();
-    let stderr = stderr.trim();
-    let guidance = "opencode review exited before producing a final assistant response. This usually means the review ended early or handed work off without returning a final result.";
-
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => guidance.to_owned(),
-        (false, true) => format!("{guidance}\n\nCaptured output:\n{stdout}"),
-        (true, false) => format!("{guidance}\n\nDiagnostics:\n{stderr}"),
-        (false, false) => {
-            format!("{guidance}\n\nCaptured output:\n{stdout}\n\nDiagnostics:\n{stderr}")
-        }
-    }
-}
-
 #[cfg(test)]
 pub(super) fn format_review_success_output(stdout: &str, stderr: &str) -> String {
     let stdout = stdout.trim();
@@ -1421,7 +1793,7 @@ pub(super) fn format_review_success_output(stdout: &str, stderr: &str) -> String
         (false, true) => stdout.to_owned(),
         (false, false) => format!("{stdout}\n\nDiagnostics:\n{stderr}"),
         (true, false) => format!("Diagnostics:\n{stderr}"),
-        (true, true) => "opencode review completed with no output.".to_owned(),
+        (true, true) => "opencode review session ended with no output.".to_owned(),
     }
 }
 
@@ -1515,10 +1887,30 @@ pub(super) fn append_review_chunk(review_output: &mut ReviewOutputState, chunk: 
     rebuild_review_output_from_terminal(review_output);
 }
 
+pub(super) fn review_process_active(review_output: &ReviewOutputState) -> bool {
+    review_output.status == ReviewStatus::Running && review_output.captured_at.is_none()
+}
+
+pub(super) fn review_session_ready(review_output: &ReviewOutputState) -> bool {
+    review_output.status == ReviewStatus::Running
+        && review_output.captured_at.is_some()
+        && review_output.session_id.is_some()
+}
+
 pub(super) fn review_summary_text(review_output: &ReviewOutputState) -> String {
     let status = match review_output.status {
-        ReviewStatus::Running => format!("{} running", review_output.output_kind.subject_label()),
-        ReviewStatus::Completed => format!("{} ready", review_output.output_kind.subject_label()),
+        ReviewStatus::Running if review_process_active(review_output) => {
+            format!("{} running", review_output.output_kind.subject_label())
+        }
+        ReviewStatus::Running if review_output.session_id.is_some() => {
+            format!(
+                "{} session active",
+                review_output.output_kind.subject_label()
+            )
+        }
+        ReviewStatus::Running => {
+            format!("{} output ready", review_output.output_kind.subject_label())
+        }
         ReviewStatus::Cancelled => {
             format!("{} canceled", review_output.output_kind.subject_label())
         }
@@ -1554,13 +1946,18 @@ pub(super) fn render_review_window(
     }
 
     let title = match review_output.status {
-        ReviewStatus::Running => format!(
+        ReviewStatus::Running if review_process_active(review_output) => format!(
             "{} in progress: {}",
             review_output.output_kind.subject_label(),
             review_output.target
         ),
-        ReviewStatus::Completed => format!(
-            "{} output: {}",
+        ReviewStatus::Running if review_output.session_id.is_some() => format!(
+            "{} session active: {}",
+            review_output.output_kind.subject_label(),
+            review_output.target
+        ),
+        ReviewStatus::Running => format!(
+            "{} output ready: {}",
             review_output.output_kind.subject_label(),
             review_output.target
         ),
@@ -1577,8 +1974,7 @@ pub(super) fn render_review_window(
     };
     let mut open = review_output.open;
     let status_line = review_summary_text(review_output);
-    let can_send_follow_up =
-        review_output.status != ReviewStatus::Running && review_output.session_id.is_some();
+    let can_send_follow_up = review_session_ready(review_output);
     let mut send_follow_up = false;
 
     egui::Window::new(title)
@@ -1611,7 +2007,7 @@ pub(super) fn render_review_window(
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .max_height(output_max_height)
-                .stick_to_bottom(review_output.status == ReviewStatus::Running)
+                .stick_to_bottom(review_process_active(review_output))
                 .show(ui, |scroll| {
                     let content_job = review_output_layout_job(review_output, scroll);
                     scroll.add(egui::Label::new(content_job).extend().selectable(true));
@@ -1768,6 +2164,86 @@ fn review_settings_has_env_var(review_settings: &ReviewCommandSettings, key: &st
         .any(|candidate| candidate.eq_ignore_ascii_case(key))
 }
 
+pub(super) fn review_launch_repo_path_and_settings(
+    launch: &ReviewLaunchPlan,
+) -> Option<(&str, &ReviewCommandSettings)> {
+    match launch {
+        ReviewLaunchPlan::Custom {
+            repo_path,
+            review_settings,
+            ..
+        }
+        | ReviewLaunchPlan::PrDescription {
+            repo_path,
+            review_settings,
+            ..
+        } => Some((repo_path.as_str(), review_settings)),
+        ReviewLaunchPlan::FollowUp { .. } => None,
+    }
+}
+
+fn review_server_for_launch(
+    launch: &ReviewLaunchPlan,
+    github_token: &str,
+) -> Result<ReviewServer, String> {
+    let Some((repo_path, review_settings)) = review_launch_repo_path_and_settings(launch) else {
+        return Err("Unexpected follow-up launch while starting a new review backend.".to_owned());
+    };
+
+    ReviewServer::start(repo_path, review_settings, github_token)
+}
+
+fn reserve_local_port() -> Result<u16, String> {
+    let listener = TcpListener::bind((OPENCODE_SERVER_HOST, 0))
+        .map_err(|err| format!("Failed to reserve a local opencode server port: {err}"))?;
+    listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|err| format!("Failed to inspect reserved opencode server port: {err}"))
+}
+
+fn review_server_health_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(Duration::from_millis(OPENCODE_SERVER_HEALTH_TIMEOUT_MS))
+        .build()
+        .map_err(|err| format!("Failed to build opencode server health client: {err}"))
+}
+
+fn review_server_healthy(url: &str) -> bool {
+    let Ok(client) = review_server_health_client() else {
+        return false;
+    };
+
+    client
+        .get(format!("{url}{OPENCODE_SERVER_HEALTH_PATH}"))
+        .send()
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
+fn wait_for_review_server(url: &str, child: &mut Child) -> Result<(), String> {
+    for _ in 0..OPENCODE_SERVER_STARTUP_RETRIES {
+        if review_server_healthy(url) {
+            return Ok(());
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("Failed to inspect opencode serve startup: {err}"))?
+        {
+            return Err(format!(
+                "opencode serve exited before it became healthy: {status}"
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(OPENCODE_SERVER_STARTUP_DELAY_MS));
+    }
+
+    Err(format!(
+        "Timed out waiting for opencode serve at {url} to become healthy."
+    ))
+}
+
 pub(super) fn custom_review_command_available() -> bool {
     default_review_prompt_md_path().is_some_and(|path| path.exists())
 }
@@ -1842,14 +2318,15 @@ mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
     use crate::domain::ReviewCommandSettings;
+    use chrono::Utc;
     use serde_json::json;
 
     use super::{
-        ReviewCommandCapture, ReviewLaunchPlan, ansi_color_from_4bit, append_review_chunk,
-        append_review_follow_up_prompt, custom_command_prompt_message,
-        format_review_incomplete_output, initial_review_output_state,
-        pr_description_prompt_md_path, render_review_json_event, review_command_envs,
-        review_event_session_id, review_output_plain_text, review_prompt_md_path,
+        ReviewLaunchPlan, ansi_color_from_4bit, append_review_chunk,
+        append_review_follow_up_prompt, custom_command_prompt_message, initial_review_output_state,
+        pr_description_prompt_md_path, render_review_json_event, render_review_part,
+        review_command_envs, review_event_session_id, review_output_plain_text,
+        review_process_active, review_prompt_md_path, review_session_ready,
         strip_ansi_escape_codes,
     };
 
@@ -2028,8 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn render_review_json_event_marks_text_response_as_ready_signal() {
-        let mut capture = ReviewCommandCapture::default();
+    fn render_review_json_event_renders_text_without_marking_completion() {
         let event = json!({
             "type": "text",
             "part": {
@@ -2037,15 +2513,13 @@ mod tests {
             }
         });
 
-        let rendered = render_review_json_event(&event, &mut capture);
+        let rendered = render_review_json_event(&event);
 
         assert_eq!(rendered.as_deref(), Some("Review posted successfully\n\n"));
-        assert!(capture.saw_text_response);
     }
 
     #[test]
-    fn render_review_json_event_formats_tool_output_without_ready_signal() {
-        let mut capture = ReviewCommandCapture::default();
+    fn render_review_json_event_formats_tool_output_without_marking_completion() {
         let event = json!({
             "type": "tool_use",
             "part": {
@@ -2057,13 +2531,44 @@ mod tests {
             }
         });
 
-        let rendered = render_review_json_event(&event, &mut capture);
+        let rendered = render_review_json_event(&event);
 
         assert_eq!(
             rendered.as_deref(),
             Some("[task] Explore repo\ntask_id: child-session\n\n")
         );
-        assert!(!capture.saw_text_response);
+    }
+
+    #[test]
+    fn render_review_json_event_ignores_step_finish_markers() {
+        let event = json!({
+            "type": "step_finish",
+            "part": {
+                "reason": "stop",
+                "snapshot": "abc123"
+            }
+        });
+
+        assert!(render_review_json_event(&event).is_none());
+    }
+
+    #[test]
+    fn render_review_part_formats_session_tool_parts() {
+        let part = json!({
+            "id": "prt_123",
+            "type": "tool",
+            "tool": "task",
+            "state": {
+                "status": "completed",
+                "title": "Review summary",
+                "output": "Posted GitHub review comment"
+            }
+        });
+
+        assert_eq!(
+            render_review_part(&part).as_deref(),
+            Some("[task] Review summary\nPosted GitHub review comment\n\n")
+        );
     }
 
     #[test]
@@ -2090,10 +2595,32 @@ mod tests {
     }
 
     #[test]
-    fn format_review_incomplete_output_explains_missing_final_response() {
-        let message = format_review_incomplete_output("[task] spawned child", "");
+    fn review_summary_text_reports_session_active_status() {
+        let mut review_output = review_state();
+        review_output.captured_at = Some(Utc::now());
+        review_output.session_id = Some(String::from("ses_123"));
 
-        assert!(message.contains("exited before producing a final assistant response"));
-        assert!(message.contains("[task] spawned child"));
+        assert!(super::review_summary_text(&review_output).starts_with("Review session active:"));
+        assert!(review_session_ready(&review_output));
+    }
+
+    #[test]
+    fn review_summary_text_reports_output_ready_without_session_id() {
+        let mut review_output = review_state();
+        review_output.captured_at = Some(Utc::now());
+
+        assert!(super::review_summary_text(&review_output).starts_with("Review output ready:"));
+        assert!(!review_session_ready(&review_output));
+    }
+
+    #[test]
+    fn review_process_active_requires_running_state_without_completion_time() {
+        let mut review_output = review_state();
+
+        assert!(review_process_active(&review_output));
+
+        review_output.captured_at = Some(Utc::now());
+
+        assert!(!review_process_active(&review_output));
     }
 }

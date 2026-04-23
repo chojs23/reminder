@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use eframe::egui::{self, Layout, RichText};
+use eframe::egui::{self, Color32, Layout, Response, RichText};
 use egui_extras::{Column, TableBuilder};
 
-use crate::domain::{PullRequestKey, RepoPullRequest};
+use crate::domain::{PullRequestKey, PullRequestReviewerStatus, RepoPullRequest};
+
+const APPROVED_TITLE_CHECK_COLOR: Color32 = Color32::from_rgb(80, 170, 90);
 
 use super::{
     super::{
@@ -290,11 +292,15 @@ fn pull_request_matches_search(pull_request: &RepoPullRequest, filter: &SearchFi
     let hash_alias = format!("#{}", pull_request.number);
     let repo_number_alias = format!("{}#{}", pull_request.repo, pull_request.number);
     let title = pull_request.display_title();
+    let merge_direction = pull_request.merge_direction_text();
     let author = pull_request.author_login.as_deref().unwrap_or("");
     let fields = [
         pull_request.repo.as_str(),
         title.as_str(),
         pull_request.title.as_str(),
+        pull_request.head_ref.as_str(),
+        pull_request.base_ref.as_str(),
+        merge_direction.as_str(),
         pull_request.url.as_str(),
         author,
         number_alias.as_str(),
@@ -510,6 +516,32 @@ fn render_pull_request_signal_badges(ui: &mut egui::Ui, signals: RepoSortSignals
     }
 }
 
+fn pull_request_has_approved_badge(pull_request: &RepoPullRequest) -> bool {
+    pull_request.my_review_status == Some(PullRequestReviewerStatus::Approved)
+}
+
+fn render_pull_request_title(ui: &mut egui::Ui, pull_request: &RepoPullRequest) -> Response {
+    let response = ui.hyperlink_to(
+        RichText::new(pull_request.display_title()),
+        &pull_request.url,
+    );
+    if pull_request_has_approved_badge(pull_request) {
+        ui.small(
+            RichText::new("✓")
+                .strong()
+                .color(APPROVED_TITLE_CHECK_COLOR),
+        )
+        .on_hover_text("You approved this pull request.");
+    }
+    response
+}
+
+fn render_pull_request_branch_direction(ui: &mut egui::Ui, pull_request: &RepoPullRequest) {
+    ui.small(
+        RichText::new(pull_request.merge_direction_text()).color(ui.visuals().weak_text_color()),
+    );
+}
+
 fn render_pull_request_cards(
     ui: &mut egui::Ui,
     pull_requests: &[&RepoPullRequest],
@@ -528,10 +560,7 @@ fn render_pull_request_cards(
         ui.group(|card| {
             card.vertical(|column| {
                 column.horizontal_wrapped(|row| {
-                    let response = row.hyperlink_to(
-                        RichText::new(pull_request.display_title()),
-                        &pull_request.url,
-                    );
+                    let response = render_pull_request_title(row, pull_request);
                     if pull_request.draft {
                         row.small(RichText::new("Draft").strong());
                     }
@@ -543,6 +572,7 @@ fn render_pull_request_cards(
                     }
                     render_pull_request_signal_badges(row, signals);
                 });
+                render_pull_request_branch_direction(column, pull_request);
                 column.small(pull_request_summary_text(context, pull_request));
                 column.small(format!(
                     "Updated {}",
@@ -610,15 +640,13 @@ fn render_pull_request_table(
                         body.row(38.0, |mut row| {
                             row.col(|ui| {
                                 ui.horizontal_wrapped(|row_ui| {
-                                    row_ui.hyperlink_to(
-                                        RichText::new(pull_request.display_title()),
-                                        &pull_request.url,
-                                    );
+                                    render_pull_request_title(row_ui, pull_request);
                                     if pull_request.draft {
                                         row_ui.small(RichText::new("Draft").strong());
                                     }
                                     render_pull_request_signal_badges(row_ui, signals);
                                 });
+                                render_pull_request_branch_direction(ui, pull_request);
                                 ui.small(pull_request_summary_text(context, pull_request));
                             });
                             row.col(|ui| {
@@ -780,11 +808,12 @@ mod tests {
     use super::{
         PullRequestActionAvailability, RepoContextInfo, RepoSortMode, RepoSortSignals,
         pr_description_unavailable_hover_text, pull_request_action_availability,
-        pull_request_matches_search, pull_request_summary_text, sort_pull_requests,
+        pull_request_has_approved_badge, pull_request_matches_search, pull_request_summary_text,
+        render_pull_request_branch_direction, sort_pull_requests,
     };
     use crate::{
         app::search::SearchFilter,
-        domain::{PullRequestKey, RepoPullRequest},
+        domain::{PullRequestKey, PullRequestReviewerStatus, RepoPullRequest},
     };
     use chrono::Utc;
     use std::collections::BTreeMap;
@@ -795,9 +824,12 @@ mod tests {
             number: 123,
             title: String::from("Improve filters"),
             url: String::from("https://github.com/acme/repo/pull/123"),
+            head_ref: String::from("feature/filters"),
+            base_ref: String::from("main"),
             updated_at: Utc::now(),
             author_login: Some(String::from("neo")),
             draft: false,
+            my_review_status: None,
         }
     }
 
@@ -814,6 +846,14 @@ mod tests {
         assert!(pull_request_matches_search(
             &pull_request(),
             &SearchFilter::new("neo")
+        ));
+    }
+
+    #[test]
+    fn pull_request_search_matches_merge_direction() {
+        assert!(pull_request_matches_search(
+            &pull_request(),
+            &SearchFilter::new("feature/filters -> main")
         ));
     }
 
@@ -895,6 +935,26 @@ mod tests {
             pull_request_summary_text(&context, &pr),
             "Review requested by alice"
         );
+    }
+
+    #[test]
+    fn approved_badge_only_shows_for_approved_reviews() {
+        let mut pr = pull_request();
+        assert!(!pull_request_has_approved_badge(&pr));
+
+        pr.my_review_status = Some(PullRequestReviewerStatus::Commented);
+        assert!(!pull_request_has_approved_badge(&pr));
+
+        pr.my_review_status = Some(PullRequestReviewerStatus::Approved);
+        assert!(pull_request_has_approved_badge(&pr));
+    }
+
+    #[test]
+    fn branch_direction_helper_uses_head_to_base_format() {
+        let pr = pull_request();
+
+        assert_eq!(pr.merge_direction_text(), "feature/filters -> main");
+        let _ = render_pull_request_branch_direction;
     }
 
     #[test]

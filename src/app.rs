@@ -939,6 +939,7 @@ impl ReminderApp {
     fn poll_jobs(&mut self) {
         for account in &mut self.accounts {
             account.poll_job();
+            account.poll_notification_metadata_job();
             account.poll_action_jobs();
             account.poll_review_job();
             account.poll_review_request_jobs();
@@ -1697,6 +1698,9 @@ mod tests {
             repo: "acme/repo".into(),
             title: "Title".into(),
             url: None,
+            head_ref: None,
+            base_ref: None,
+            my_review_status: None,
             reason: reason.into(),
             updated_at: parse_utc(updated),
             last_read_at: None,

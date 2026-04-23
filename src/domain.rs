@@ -42,6 +42,9 @@ pub struct NotificationItem {
     pub repo: String,
     pub title: String,
     pub url: Option<String>,
+    pub head_ref: Option<String>,
+    pub base_ref: Option<String>,
+    pub my_review_status: Option<PullRequestReviewerStatus>,
     pub reason: String,
     pub updated_at: DateTime<Utc>,
     pub last_read_at: Option<DateTime<Utc>>,
@@ -78,6 +81,14 @@ impl NotificationItem {
             }
             None => self.title.clone(),
         }
+    }
+
+    pub fn merge_direction_text(&self) -> Option<String> {
+        Some(format!(
+            "{} -> {}",
+            self.head_ref.as_deref()?,
+            self.base_ref.as_deref()?
+        ))
     }
 }
 
@@ -138,9 +149,12 @@ pub struct RepoPullRequest {
     pub number: u64,
     pub title: String,
     pub url: String,
+    pub head_ref: String,
+    pub base_ref: String,
     pub updated_at: DateTime<Utc>,
     pub author_login: Option<String>,
     pub draft: bool,
+    pub my_review_status: Option<PullRequestReviewerStatus>,
 }
 
 impl RepoPullRequest {
@@ -155,6 +169,10 @@ impl RepoPullRequest {
 
     pub fn review_thread_id(&self) -> String {
         format!("repo-pr:{}#{}", self.repo, self.number)
+    }
+
+    pub fn merge_direction_text(&self) -> String {
+        format!("{} -> {}", self.head_ref, self.base_ref)
     }
 
     pub fn pr_description_thread_id(&self) -> String {
@@ -260,6 +278,9 @@ mod tests {
             repo: "acme/repo".into(),
             title: "Title".into(),
             url: url.map(str::to_owned),
+            head_ref: None,
+            base_ref: None,
+            my_review_status: None,
             reason: "review_requested".into(),
             updated_at: Utc::now(),
             last_read_at: None,
@@ -337,15 +358,30 @@ mod tests {
     }
 
     #[test]
+    fn notification_merge_direction_formats_head_to_base() {
+        let mut item = notification(Some("https://github.com/acme/repo/pull/123"));
+        item.head_ref = Some("feature/filtering".into());
+        item.base_ref = Some("main".into());
+
+        assert_eq!(
+            item.merge_direction_text().as_deref(),
+            Some("feature/filtering -> main")
+        );
+    }
+
+    #[test]
     fn repo_pull_request_display_title_prefixes_number() {
         let pull_request = RepoPullRequest {
             repo: "acme/repo".into(),
             number: 123,
             title: "Improve filtering".into(),
             url: "https://github.com/acme/repo/pull/123".into(),
+            head_ref: "feature/filtering".into(),
+            base_ref: "main".into(),
             updated_at: Utc::now(),
             author_login: Some("neo".into()),
             draft: false,
+            my_review_status: None,
         };
 
         assert_eq!(pull_request.display_title(), "#123 Improve filtering");
@@ -358,9 +394,12 @@ mod tests {
             number: 123,
             title: "Improve filtering".into(),
             url: "https://github.com/acme/repo/pull/123".into(),
+            head_ref: "feature/filtering".into(),
+            base_ref: "main".into(),
             updated_at: Utc::now(),
             author_login: Some("neo".into()),
             draft: false,
+            my_review_status: None,
         };
 
         assert_eq!(pull_request.review_thread_id(), "repo-pr:acme/repo#123");
@@ -373,14 +412,38 @@ mod tests {
             number: 123,
             title: "Improve filters".into(),
             url: "https://github.com/acme/repo/pull/123".into(),
+            head_ref: "feature/filtering".into(),
+            base_ref: "main".into(),
             updated_at: Utc::now(),
             author_login: Some("neo".into()),
             draft: false,
+            my_review_status: None,
         };
 
         assert_eq!(
             pull_request.pr_description_thread_id(),
             "repo-pr-description:acme/repo#123"
+        );
+    }
+
+    #[test]
+    fn repo_pull_request_merge_direction_formats_head_to_base() {
+        let pull_request = RepoPullRequest {
+            repo: "acme/repo".into(),
+            number: 123,
+            title: "Improve filters".into(),
+            url: "https://github.com/acme/repo/pull/123".into(),
+            head_ref: "feature/filtering".into(),
+            base_ref: "main".into(),
+            updated_at: Utc::now(),
+            author_login: Some("neo".into()),
+            draft: false,
+            my_review_status: None,
+        };
+
+        assert_eq!(
+            pull_request.merge_direction_text(),
+            "feature/filtering -> main"
         );
     }
 }
