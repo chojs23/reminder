@@ -47,7 +47,7 @@ fn render_part(part: &Value) -> Option<String> {
             let name = part.get("name").and_then(Value::as_str).unwrap_or("tool");
             let input_summary = part
                 .get("input")
-                .map(|input| summarize_tool_input(input))
+                .map(summarize_tool_input)
                 .unwrap_or_default();
             if input_summary.is_empty() {
                 Some(format!("[{name}]\n\n"))
@@ -91,8 +91,9 @@ fn summarize_tool_input(input: &Value) -> String {
         }
     }
     let compact = input.to_string();
-    if compact.len() > 200 {
-        format!("{}...", &compact[..200])
+    if compact.chars().count() > 200 {
+        let truncated: String = compact.chars().take(200).collect();
+        format!("{truncated}...")
     } else {
         compact
     }
