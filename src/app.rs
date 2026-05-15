@@ -486,6 +486,12 @@ impl ReminderApp {
         let additional_args = parse_review_additional_args(&editor.additional_args_text);
         let login = editor.login.clone();
         let review_settings = ReviewCommandSettings {
+            backend: self
+                .accounts
+                .iter()
+                .find(|account| account.profile.login == login)
+                .map(|account| account.profile.review_settings.backend)
+                .unwrap_or_default(),
             env_vars,
             additional_args,
             review_prompt_md_path: normalize_optional_path(&editor.review_prompt_md_path_text),
