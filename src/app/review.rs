@@ -1399,6 +1399,7 @@ fn run_custom_review(
         command,
         context.child_handle,
         context.cancel_requested,
+        crate::domain::ReviewBackend::Opencode,
     )
 }
 
@@ -1439,6 +1440,7 @@ fn run_pr_description(
         command,
         context.child_handle,
         context.cancel_requested,
+        crate::domain::ReviewBackend::Opencode,
     )
 }
 
@@ -1478,6 +1480,7 @@ fn run_review_follow_up(
         command,
         context.child_handle,
         context.cancel_requested,
+        crate::domain::ReviewBackend::Opencode,
     )
 }
 
@@ -1520,6 +1523,7 @@ fn read_review_json_stream(
     shell_mirror: &Arc<Mutex<Option<ReviewShellMirror>>>,
     cancel_requested: &Arc<AtomicBool>,
     stream_label: &str,
+    backend: crate::domain::ReviewBackend,
 ) -> Result<ReviewCommandCapture, String> {
     let mut capture = ReviewCommandCapture::default();
     let mut reader = BufReader::new(reader);
@@ -1548,12 +1552,26 @@ fn read_review_json_stream(
 
             let rendered = if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
                 if capture.session_id.is_none() {
-                    capture.session_id = review_event_session_id(&event).map(str::to_owned);
+                    capture.session_id = match backend {
+                        crate::domain::ReviewBackend::Opencode => {
+                            review_event_session_id(&event).map(str::to_owned)
+                        }
+                        crate::domain::ReviewBackend::Claude => {
+                            crate::app::review_claude::session_id(&event).map(str::to_owned)
+                        }
+                    };
                 }
-                if let Some(part_id) = review_event_part_id(&event) {
-                    capture.seen_part_ids.insert(part_id.to_owned());
+                if matches!(backend, crate::domain::ReviewBackend::Opencode) {
+                    if let Some(part_id) = review_event_part_id(&event) {
+                        capture.seen_part_ids.insert(part_id.to_owned());
+                    }
                 }
-                render_review_json_event(&event)
+                match backend {
+                    crate::domain::ReviewBackend::Opencode => render_review_json_event(&event),
+                    crate::domain::ReviewBackend::Claude => {
+                        crate::app::review_claude::render_event(&event)
+                    }
+                }
             } else {
                 Some(format!("{trimmed}\n"))
             };
@@ -1567,12 +1585,26 @@ fn read_review_json_stream(
     if !trailing.is_empty() {
         let rendered = if let Ok(event) = serde_json::from_str::<Value>(trailing) {
             if capture.session_id.is_none() {
-                capture.session_id = review_event_session_id(&event).map(str::to_owned);
+                capture.session_id = match backend {
+                    crate::domain::ReviewBackend::Opencode => {
+                        review_event_session_id(&event).map(str::to_owned)
+                    }
+                    crate::domain::ReviewBackend::Claude => {
+                        crate::app::review_claude::session_id(&event).map(str::to_owned)
+                    }
+                };
             }
-            if let Some(part_id) = review_event_part_id(&event) {
-                capture.seen_part_ids.insert(part_id.to_owned());
+            if matches!(backend, crate::domain::ReviewBackend::Opencode) {
+                if let Some(part_id) = review_event_part_id(&event) {
+                    capture.seen_part_ids.insert(part_id.to_owned());
+                }
             }
-            render_review_json_event(&event)
+            match backend {
+                crate::domain::ReviewBackend::Opencode => render_review_json_event(&event),
+                crate::domain::ReviewBackend::Claude => {
+                    crate::app::review_claude::render_event(&event)
+                }
+            }
         } else {
             Some(format!("{trailing}\n"))
         };
@@ -1592,6 +1624,7 @@ fn stream_review_command(
     mut command: Command,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
+    backend: crate::domain::ReviewBackend,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut child = command.spawn().map_err(|err| ReviewRunFailure {
         message: format!("Failed to start review: {err}"),
@@ -1687,6 +1720,7 @@ fn stream_review_command(
         &shell_mirror,
         &cancel_requested,
         "output",
+        backend,
     )
     .map_err(|message| ReviewRunFailure {
         message,
@@ -1751,20 +1785,22 @@ fn stream_review_command(
     }
 
     if status.success() {
-        if let Some(session_id) = stdout_capture.session_id.clone() {
-            wait_for_review_session_settle(
-                &mut stdout_capture,
-                &shell_mirror,
-                tx,
-                thread_id,
-                attach_url,
-                &session_id,
-                &cancel_requested,
-            )
-            .map_err(|message| ReviewRunFailure {
-                message,
-                session_id: Some(session_id),
-            })?;
+        if matches!(backend, crate::domain::ReviewBackend::Opencode) {
+            if let Some(session_id) = stdout_capture.session_id.clone() {
+                wait_for_review_session_settle(
+                    &mut stdout_capture,
+                    &shell_mirror,
+                    tx,
+                    thread_id,
+                    attach_url,
+                    &session_id,
+                    &cancel_requested,
+                )
+                .map_err(|message| ReviewRunFailure {
+                    message,
+                    session_id: Some(session_id),
+                })?;
+            }
         }
         finish_review_shell_stream(&shell_mirror, tx, thread_id, "session ready");
         return Ok(ReviewRunOutcome::Completed {
