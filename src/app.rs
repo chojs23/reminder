@@ -39,7 +39,8 @@ use self::{
 
 use crate::{
     domain::{
-        GitHubAccount, PullRequestReviewer, PullRequestReviewerStatus, ReviewCommandSettings,
+        GitHubAccount, PullRequestReviewer, PullRequestReviewerStatus, ReviewBackend,
+        ReviewCommandSettings,
     },
     storage::AccountStore,
 };
@@ -451,6 +452,7 @@ impl ReminderApp {
 
         self.review_settings_editor = Some(AccountReviewSettingsEditor {
             login: account.profile.login.clone(),
+            backend: account.profile.review_settings.backend,
             env_vars_text: format_review_env_vars(&account.profile.review_settings),
             additional_args_text: format_review_additional_args(&account.profile.review_settings),
             review_prompt_md_path_text: account
@@ -487,12 +489,7 @@ impl ReminderApp {
         let additional_args = parse_review_additional_args(&editor.additional_args_text);
         let login = editor.login.clone();
         let review_settings = ReviewCommandSettings {
-            backend: self
-                .accounts
-                .iter()
-                .find(|account| account.profile.login == login)
-                .map(|account| account.profile.review_settings.backend)
-                .unwrap_or_default(),
+            backend: editor.backend,
             env_vars,
             additional_args,
             review_prompt_md_path: normalize_optional_path(&editor.review_prompt_md_path_text),
@@ -545,6 +542,16 @@ impl ReminderApp {
             .resizable(true)
             .default_size(egui::vec2(520.0, 360.0))
             .show(ctx, |ui| {
+                ui.label("Review backend");
+                ui.horizontal(|row| {
+                    row.radio_value(&mut editor.backend, ReviewBackend::Opencode, "Opencode");
+                    row.radio_value(&mut editor.backend, ReviewBackend::Claude, "Claude Code");
+                });
+                let claude_selected = matches!(editor.backend, ReviewBackend::Claude);
+                if claude_selected {
+                    ui.label("Claude Code uses ~/.claude/commands/ instead of the prompt paths below.");
+                }
+                ui.add_space(8.0);
                 ui.label("Environment variables (one KEY=VALUE per line)");
                 ui.add(
                     egui::TextEdit::multiline(&mut editor.env_vars_text)
@@ -560,19 +567,21 @@ impl ReminderApp {
                         .hint_text("--lang korean"),
                 );
                 ui.add_space(8.0);
-                ui.label("Review prompt md path");
-                ui.add(
-                    egui::TextEdit::singleline(&mut editor.review_prompt_md_path_text)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(default_review_prompt_md_path_display()),
-                );
-                ui.add_space(8.0);
-                ui.label("PR Description md path");
-                ui.add(
-                    egui::TextEdit::singleline(&mut editor.pr_description_md_path_text)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(default_pr_description_prompt_md_path_display()),
-                );
+                ui.add_enabled_ui(!claude_selected, |ui| {
+                    ui.label("Review prompt md path");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut editor.review_prompt_md_path_text)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(default_review_prompt_md_path_display()),
+                    );
+                    ui.add_space(8.0);
+                    ui.label("PR Description md path");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut editor.pr_description_md_path_text)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(default_pr_description_prompt_md_path_display()),
+                    );
+                });
 
                 if let Some(error) = &editor.form_error {
                     ui.add_space(8.0);
@@ -1530,6 +1539,7 @@ struct ReviewRequestEditor {
 
 struct AccountReviewSettingsEditor {
     login: String,
+    backend: ReviewBackend,
     env_vars_text: String,
     additional_args_text: String,
     review_prompt_md_path_text: String,
