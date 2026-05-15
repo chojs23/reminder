@@ -153,11 +153,29 @@ fn prompt_from_md_or_slash(
     let Some(path) = md_path.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(slash_fallback(pr_url, pr_number));
     };
-    let body = fs::read_to_string(path)
+    let raw = fs::read_to_string(path)
         .map_err(|err| format!("Failed to read prompt file {path}: {err}"))?;
+    let body = strip_yaml_frontmatter(&raw);
     Ok(format!(
         "{body}\n\nPR URL: {pr_url}\nPR number: {pr_number}"
     ))
+}
+
+fn strip_yaml_frontmatter(text: &str) -> &str {
+    // Strip a leading `---\n...---\n` frontmatter block if present.
+    // Slash command files use frontmatter for metadata that has no meaning
+    // when the file body is passed to `claude -p`; leaving it in also causes
+    // the CLI parser to treat a leading `---` as an unknown option flag.
+    let Some(remainder) = text.strip_prefix("---\n") else {
+        return text.trim_start();
+    };
+    if let Some(end) = remainder.find("\n---\n") {
+        remainder[end + "\n---\n".len()..].trim_start()
+    } else if let Some(end) = remainder.find("\n---") {
+        remainder[end + "\n---".len()..].trim_start()
+    } else {
+        text.trim_start()
+    }
 }
 
 fn base_claude_command(
@@ -406,6 +424,49 @@ mod tests {
         assert!(prompt.starts_with("Custom review instructions."));
         assert!(prompt.contains("PR URL: https://example/pr/3"));
         assert!(prompt.contains("PR number: 3"));
+    }
+
+    #[test]
+    fn strip_frontmatter_removes_leading_block() {
+        let input = "---\ndescription: foo\n---\nBody line.\n";
+        assert_eq!(strip_yaml_frontmatter(input), "Body line.\n");
+    }
+
+    #[test]
+    fn strip_frontmatter_keeps_text_without_frontmatter() {
+        let input = "No frontmatter here.\nSecond line.\n";
+        assert_eq!(strip_yaml_frontmatter(input), input);
+    }
+
+    #[test]
+    fn strip_frontmatter_handles_trailing_dashes_without_newline() {
+        let input = "---\nkey: val\n---";
+        assert_eq!(strip_yaml_frontmatter(input), "");
+    }
+
+    #[test]
+    fn prompt_uses_file_contents_strips_frontmatter() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "reminder-prompt-fm-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "---\ndescription: foo\n---\nReview body.\n",
+        )
+        .expect("write");
+        let prompt = prompt_from_md_or_slash(
+            Some(&path.to_string_lossy()),
+            "https://example/pr/5",
+            5,
+            custom_review_slash_prompt,
+        )
+        .expect("prompt");
+        let _ = std::fs::remove_file(&path);
+        assert!(!prompt.starts_with("---"));
+        assert!(prompt.starts_with("Review body."));
+        assert!(prompt.contains("PR URL: https://example/pr/5"));
     }
 
     #[test]
