@@ -547,9 +547,10 @@ impl ReminderApp {
                     row.radio_value(&mut editor.backend, ReviewBackend::Opencode, "Opencode");
                     row.radio_value(&mut editor.backend, ReviewBackend::Claude, "Claude Code");
                 });
-                let claude_selected = matches!(editor.backend, ReviewBackend::Claude);
-                if claude_selected {
-                    ui.label("Claude Code uses ~/.claude/commands/ instead of the prompt paths below.");
+                if matches!(editor.backend, ReviewBackend::Claude) {
+                    ui.label(
+                        "Claude Code falls back to /review-pr from ~/.claude/commands/ when the paths below are empty.",
+                    );
                 }
                 ui.add_space(8.0);
                 ui.label("Environment variables (one KEY=VALUE per line)");
@@ -567,21 +568,19 @@ impl ReminderApp {
                         .hint_text("--lang korean"),
                 );
                 ui.add_space(8.0);
-                ui.add_enabled_ui(!claude_selected, |ui| {
-                    ui.label("Review prompt md path");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut editor.review_prompt_md_path_text)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(default_review_prompt_md_path_display()),
-                    );
-                    ui.add_space(8.0);
-                    ui.label("PR Description md path");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut editor.pr_description_md_path_text)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(default_pr_description_prompt_md_path_display()),
-                    );
-                });
+                ui.label("Review prompt md path");
+                ui.add(
+                    egui::TextEdit::singleline(&mut editor.review_prompt_md_path_text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(default_review_prompt_md_path_display()),
+                );
+                ui.add_space(8.0);
+                ui.label("PR Description md path");
+                ui.add(
+                    egui::TextEdit::singleline(&mut editor.pr_description_md_path_text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(default_pr_description_prompt_md_path_display()),
+                );
 
                 if let Some(error) = &editor.form_error {
                     ui.add_space(8.0);
