@@ -3,6 +3,7 @@ mod notification_state;
 mod repo_paths;
 mod repo_state;
 mod review;
+mod review_claude;
 mod scheduler;
 mod search;
 mod state;
@@ -38,7 +39,8 @@ use self::{
 
 use crate::{
     domain::{
-        GitHubAccount, PullRequestReviewer, PullRequestReviewerStatus, ReviewCommandSettings,
+        GitHubAccount, PullRequestReviewer, PullRequestReviewerStatus, ReviewBackend,
+        ReviewCommandSettings,
     },
     storage::AccountStore,
 };
@@ -450,6 +452,7 @@ impl ReminderApp {
 
         self.review_settings_editor = Some(AccountReviewSettingsEditor {
             login: account.profile.login.clone(),
+            backend: account.profile.review_settings.backend,
             env_vars_text: format_review_env_vars(&account.profile.review_settings),
             additional_args_text: format_review_additional_args(&account.profile.review_settings),
             review_prompt_md_path_text: account
@@ -486,6 +489,7 @@ impl ReminderApp {
         let additional_args = parse_review_additional_args(&editor.additional_args_text);
         let login = editor.login.clone();
         let review_settings = ReviewCommandSettings {
+            backend: editor.backend,
             env_vars,
             additional_args,
             review_prompt_md_path: normalize_optional_path(&editor.review_prompt_md_path_text),
@@ -538,6 +542,17 @@ impl ReminderApp {
             .resizable(true)
             .default_size(egui::vec2(520.0, 360.0))
             .show(ctx, |ui| {
+                ui.label("Review backend");
+                ui.horizontal(|row| {
+                    row.radio_value(&mut editor.backend, ReviewBackend::Opencode, "Opencode");
+                    row.radio_value(&mut editor.backend, ReviewBackend::Claude, "Claude Code");
+                });
+                if matches!(editor.backend, ReviewBackend::Claude) {
+                    ui.label(
+                        "Claude Code falls back to /review-pr from ~/.claude/commands/ when the paths below are empty.",
+                    );
+                }
+                ui.add_space(8.0);
                 ui.label("Environment variables (one KEY=VALUE per line)");
                 ui.add(
                     egui::TextEdit::multiline(&mut editor.env_vars_text)
@@ -553,18 +568,28 @@ impl ReminderApp {
                         .hint_text("--lang korean"),
                 );
                 ui.add_space(8.0);
+                let (review_hint, pr_description_hint) = match editor.backend {
+                    ReviewBackend::Opencode => (
+                        default_review_prompt_md_path_display(),
+                        default_pr_description_prompt_md_path_display(),
+                    ),
+                    ReviewBackend::Claude => (
+                        review_claude::default_review_prompt_md_path_display(),
+                        review_claude::default_pr_description_prompt_md_path_display(),
+                    ),
+                };
                 ui.label("Review prompt md path");
                 ui.add(
                     egui::TextEdit::singleline(&mut editor.review_prompt_md_path_text)
                         .desired_width(f32::INFINITY)
-                        .hint_text(default_review_prompt_md_path_display()),
+                        .hint_text(review_hint),
                 );
                 ui.add_space(8.0);
                 ui.label("PR Description md path");
                 ui.add(
                     egui::TextEdit::singleline(&mut editor.pr_description_md_path_text)
                         .desired_width(f32::INFINITY)
-                        .hint_text(default_pr_description_prompt_md_path_display()),
+                        .hint_text(pr_description_hint),
                 );
 
                 if let Some(error) = &editor.form_error {
@@ -1523,6 +1548,7 @@ struct ReviewRequestEditor {
 
 struct AccountReviewSettingsEditor {
     login: String,
+    backend: ReviewBackend,
     env_vars_text: String,
     additional_args_text: String,
     review_prompt_md_path_text: String,

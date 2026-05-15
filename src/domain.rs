@@ -5,8 +5,18 @@ use serde::{Deserialize, Serialize};
 
 // Domain data structures shared across modules.
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewBackend {
+    #[default]
+    Opencode,
+    Claude,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewCommandSettings {
+    #[serde(default)]
+    pub backend: ReviewBackend,
     #[serde(default)]
     pub env_vars: BTreeMap<String, String>,
     #[serde(default)]
@@ -269,8 +279,27 @@ impl ReviewSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{NotificationItem, RepoPullRequest};
+    use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn review_command_settings_defaults_backend_to_opencode_when_field_missing() {
+        let json = r#"{"env_vars":{},"additional_args":[]}"#;
+        let parsed: ReviewCommandSettings = serde_json::from_str(json).expect("parse");
+        assert_eq!(parsed.backend, ReviewBackend::Opencode);
+    }
+
+    #[test]
+    fn review_command_settings_round_trips_claude_backend() {
+        let settings = ReviewCommandSettings {
+            backend: ReviewBackend::Claude,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let parsed: ReviewCommandSettings = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.backend, ReviewBackend::Claude);
+        assert!(json.contains("\"backend\":\"claude\""));
+    }
 
     fn notification(url: Option<&str>) -> NotificationItem {
         NotificationItem {

@@ -188,7 +188,7 @@ pub(super) struct ReviewJob {
     cancel_requested: Arc<AtomicBool>,
 }
 
-enum ReviewRunOutcome {
+pub(super) enum ReviewRunOutcome {
     Completed {
         session_id: Option<String>,
     },
@@ -198,9 +198,9 @@ enum ReviewRunOutcome {
     },
 }
 
-struct ReviewRunFailure {
-    message: String,
-    session_id: Option<String>,
+pub(super) struct ReviewRunFailure {
+    pub(super) message: String,
+    pub(super) session_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -220,13 +220,13 @@ struct ReviewShellMirror {
     review_label: String,
 }
 
-struct ReviewRunContext<'a> {
-    tx: &'a mpsc::Sender<ReviewJobMessage>,
-    thread_id: &'a str,
-    review_label: &'a str,
-    attach_url: &'a str,
-    child_handle: Arc<Mutex<Option<Child>>>,
-    cancel_requested: Arc<AtomicBool>,
+pub(super) struct ReviewRunContext<'a> {
+    pub(super) tx: &'a mpsc::Sender<ReviewJobMessage>,
+    pub(super) thread_id: &'a str,
+    pub(super) review_label: &'a str,
+    pub(super) attach_url: &'a str,
+    pub(super) child_handle: Arc<Mutex<Option<Child>>>,
+    pub(super) cancel_requested: Arc<AtomicBool>,
 }
 
 impl Drop for ReviewServer {
@@ -1115,40 +1115,58 @@ impl ReviewJob {
             let attach_url = match attach_url {
                 Some(attach_url) => attach_url,
                 None => {
-                    let server = match review_server_for_launch(&launch, &github_token) {
-                        Ok(server) => server,
-                        Err(message) => {
-                            let _ = tx.send(ReviewJobMessage::FinishedFailure {
+                    let backend_is_claude = review_launch_repo_path_and_settings(&launch)
+                        .map(|(_, settings)| {
+                            matches!(settings.backend, crate::domain::ReviewBackend::Claude)
+                        })
+                        .unwrap_or(false);
+                    if backend_is_claude {
+                        if worker_cancel_requested.load(Ordering::SeqCst) {
+                            let _ = tx.send(ReviewJobMessage::FinishedCancelled {
                                 thread_id: worker_thread_id.clone(),
                                 captured_at: Utc::now(),
                                 session_id: None,
-                                message,
+                                _message: "Review canceled by user.".to_owned(),
                             });
                             return;
                         }
-                    };
+                        String::new()
+                    } else {
+                        let server = match review_server_for_launch(&launch, &github_token) {
+                            Ok(server) => server,
+                            Err(message) => {
+                                let _ = tx.send(ReviewJobMessage::FinishedFailure {
+                                    thread_id: worker_thread_id.clone(),
+                                    captured_at: Utc::now(),
+                                    session_id: None,
+                                    message,
+                                });
+                                return;
+                            }
+                        };
 
-                    if worker_cancel_requested.load(Ordering::SeqCst) {
-                        let _ = tx.send(ReviewJobMessage::FinishedCancelled {
-                            thread_id: worker_thread_id.clone(),
-                            captured_at: Utc::now(),
-                            session_id: None,
-                            _message: "Review canceled by user.".to_owned(),
-                        });
-                        return;
-                    }
+                        if worker_cancel_requested.load(Ordering::SeqCst) {
+                            let _ = tx.send(ReviewJobMessage::FinishedCancelled {
+                                thread_id: worker_thread_id.clone(),
+                                captured_at: Utc::now(),
+                                session_id: None,
+                                _message: "Review canceled by user.".to_owned(),
+                            });
+                            return;
+                        }
 
-                    let attach_url = server.url().to_owned();
-                    if tx
-                        .send(ReviewJobMessage::ServerReady {
-                            thread_id: worker_thread_id.clone(),
-                            server,
-                        })
-                        .is_err()
-                    {
-                        return;
+                        let attach_url = server.url().to_owned();
+                        if tx
+                            .send(ReviewJobMessage::ServerReady {
+                                thread_id: worker_thread_id.clone(),
+                                server,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        attach_url
                     }
-                    attach_url
                 }
             };
 
@@ -1373,6 +1391,16 @@ fn run_custom_review(
     review_settings: &ReviewCommandSettings,
     github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    if matches!(review_settings.backend, crate::domain::ReviewBackend::Claude) {
+        return crate::app::review_claude::run_custom_review(
+            context,
+            repo_path,
+            pr_number,
+            pr_url,
+            review_settings,
+            github_token,
+        );
+    }
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -1399,6 +1427,7 @@ fn run_custom_review(
         command,
         context.child_handle,
         context.cancel_requested,
+        crate::domain::ReviewBackend::Opencode,
     )
 }
 
@@ -1410,6 +1439,16 @@ fn run_pr_description(
     review_settings: &ReviewCommandSettings,
     github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    if matches!(review_settings.backend, crate::domain::ReviewBackend::Claude) {
+        return crate::app::review_claude::run_pr_description(
+            context,
+            repo_path,
+            pr_number,
+            pr_url,
+            review_settings,
+            github_token,
+        );
+    }
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -1439,6 +1478,7 @@ fn run_pr_description(
         command,
         context.child_handle,
         context.cancel_requested,
+        crate::domain::ReviewBackend::Opencode,
     )
 }
 
@@ -1450,6 +1490,16 @@ fn run_review_follow_up(
     review_settings: &ReviewCommandSettings,
     github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    if matches!(review_settings.backend, crate::domain::ReviewBackend::Claude) {
+        return crate::app::review_claude::run_review_follow_up(
+            context,
+            repo_path,
+            session_id,
+            prompt,
+            review_settings,
+            github_token,
+        );
+    }
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -1478,6 +1528,7 @@ fn run_review_follow_up(
         command,
         context.child_handle,
         context.cancel_requested,
+        crate::domain::ReviewBackend::Opencode,
     )
 }
 
@@ -1520,6 +1571,7 @@ fn read_review_json_stream(
     shell_mirror: &Arc<Mutex<Option<ReviewShellMirror>>>,
     cancel_requested: &Arc<AtomicBool>,
     stream_label: &str,
+    backend: crate::domain::ReviewBackend,
 ) -> Result<ReviewCommandCapture, String> {
     let mut capture = ReviewCommandCapture::default();
     let mut reader = BufReader::new(reader);
@@ -1548,12 +1600,26 @@ fn read_review_json_stream(
 
             let rendered = if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
                 if capture.session_id.is_none() {
-                    capture.session_id = review_event_session_id(&event).map(str::to_owned);
+                    capture.session_id = match backend {
+                        crate::domain::ReviewBackend::Opencode => {
+                            review_event_session_id(&event).map(str::to_owned)
+                        }
+                        crate::domain::ReviewBackend::Claude => {
+                            crate::app::review_claude::session_id(&event).map(str::to_owned)
+                        }
+                    };
                 }
-                if let Some(part_id) = review_event_part_id(&event) {
+                if matches!(backend, crate::domain::ReviewBackend::Opencode)
+                    && let Some(part_id) = review_event_part_id(&event)
+                {
                     capture.seen_part_ids.insert(part_id.to_owned());
                 }
-                render_review_json_event(&event)
+                match backend {
+                    crate::domain::ReviewBackend::Opencode => render_review_json_event(&event),
+                    crate::domain::ReviewBackend::Claude => {
+                        crate::app::review_claude::render_event(&event)
+                    }
+                }
             } else {
                 Some(format!("{trimmed}\n"))
             };
@@ -1567,12 +1633,26 @@ fn read_review_json_stream(
     if !trailing.is_empty() {
         let rendered = if let Ok(event) = serde_json::from_str::<Value>(trailing) {
             if capture.session_id.is_none() {
-                capture.session_id = review_event_session_id(&event).map(str::to_owned);
+                capture.session_id = match backend {
+                    crate::domain::ReviewBackend::Opencode => {
+                        review_event_session_id(&event).map(str::to_owned)
+                    }
+                    crate::domain::ReviewBackend::Claude => {
+                        crate::app::review_claude::session_id(&event).map(str::to_owned)
+                    }
+                };
             }
-            if let Some(part_id) = review_event_part_id(&event) {
+            if matches!(backend, crate::domain::ReviewBackend::Opencode)
+                && let Some(part_id) = review_event_part_id(&event)
+            {
                 capture.seen_part_ids.insert(part_id.to_owned());
             }
-            render_review_json_event(&event)
+            match backend {
+                crate::domain::ReviewBackend::Opencode => render_review_json_event(&event),
+                crate::domain::ReviewBackend::Claude => {
+                    crate::app::review_claude::render_event(&event)
+                }
+            }
         } else {
             Some(format!("{trailing}\n"))
         };
@@ -1584,7 +1664,8 @@ fn read_review_json_stream(
     Ok(capture)
 }
 
-fn stream_review_command(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stream_review_command(
     tx: &mpsc::Sender<ReviewJobMessage>,
     thread_id: &str,
     review_label: &str,
@@ -1592,6 +1673,7 @@ fn stream_review_command(
     mut command: Command,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
+    backend: crate::domain::ReviewBackend,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut child = command.spawn().map_err(|err| ReviewRunFailure {
         message: format!("Failed to start review: {err}"),
@@ -1687,6 +1769,7 @@ fn stream_review_command(
         &shell_mirror,
         &cancel_requested,
         "output",
+        backend,
     )
     .map_err(|message| ReviewRunFailure {
         message,
@@ -1751,7 +1834,9 @@ fn stream_review_command(
     }
 
     if status.success() {
-        if let Some(session_id) = stdout_capture.session_id.clone() {
+        if matches!(backend, crate::domain::ReviewBackend::Opencode)
+            && let Some(session_id) = stdout_capture.session_id.clone()
+        {
             wait_for_review_session_settle(
                 &mut stdout_capture,
                 &shell_mirror,
@@ -2133,7 +2218,7 @@ fn custom_command_prompt_message(pr_url: &str, pr_number: u64) -> String {
     format!("PR URL: {pr_url}\nPR number: {pr_number}")
 }
 
-fn review_command_envs(
+pub(super) fn review_command_envs(
     review_settings: &ReviewCommandSettings,
     github_token: &str,
 ) -> Vec<(String, String)> {

@@ -429,27 +429,51 @@ impl AccountState {
         if !self.can_send_review_follow_up(thread_id) {
             if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
                 review_output.follow_up_error = Some(
-                    "This session cannot accept follow-up because no opencode session ID was captured."
+                    "This session cannot accept follow-up because no review session ID was captured."
                         .to_owned(),
                 );
             }
             return;
         }
 
-        let attach_url = match self.review_servers.get_mut(thread_id) {
-            Some(server) => match server.health_status() {
-                ReviewServerHealth::Healthy => server.url().to_owned(),
-                ReviewServerHealth::Unhealthy => {
-                    if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
-                        review_output.follow_up_error = Some(
-                            "The review backend is still starting or temporarily unavailable. Try again in a moment."
-                                .to_owned(),
-                        );
+        let backend_is_claude = self
+            .review_outputs
+            .get(thread_id)
+            .map(|output| {
+                matches!(
+                    output.review_settings.backend,
+                    crate::domain::ReviewBackend::Claude,
+                )
+            })
+            .unwrap_or(false);
+
+        let attach_url = if backend_is_claude {
+            String::new()
+        } else {
+            match self.review_servers.get_mut(thread_id) {
+                Some(server) => match server.health_status() {
+                    ReviewServerHealth::Healthy => server.url().to_owned(),
+                    ReviewServerHealth::Unhealthy => {
+                        if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
+                            review_output.follow_up_error = Some(
+                                "The review backend is still starting or temporarily unavailable. Try again in a moment."
+                                    .to_owned(),
+                            );
+                        }
+                        return;
                     }
-                    return;
-                }
-                ReviewServerHealth::Exited => {
-                    self.review_servers.remove(thread_id);
+                    ReviewServerHealth::Exited => {
+                        self.review_servers.remove(thread_id);
+                        if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
+                            review_output.follow_up_error = Some(
+                                "This review backend is no longer available. Start a new review to continue."
+                                    .to_owned(),
+                            );
+                        }
+                        return;
+                    }
+                },
+                None => {
                     if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
                         review_output.follow_up_error = Some(
                             "This review backend is no longer available. Start a new review to continue."
@@ -458,15 +482,6 @@ impl AccountState {
                     }
                     return;
                 }
-            },
-            None => {
-                if let Some(review_output) = self.review_outputs.get_mut(thread_id) {
-                    review_output.follow_up_error = Some(
-                        "This review backend is no longer available. Start a new review to continue."
-                            .to_owned(),
-                    );
-                }
-                return;
             }
         };
 
