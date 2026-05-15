@@ -291,8 +291,10 @@ mod tests {
 
     #[test]
     fn review_command_settings_round_trips_claude_backend() {
-        let mut settings = ReviewCommandSettings::default();
-        settings.backend = ReviewBackend::Claude;
+        let settings = ReviewCommandSettings {
+            backend: ReviewBackend::Claude,
+            ..Default::default()
+        };
         let json = serde_json::to_string(&settings).expect("serialize");
         let parsed: ReviewCommandSettings = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed.backend, ReviewBackend::Claude);
