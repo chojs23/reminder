@@ -1115,40 +1115,58 @@ impl ReviewJob {
             let attach_url = match attach_url {
                 Some(attach_url) => attach_url,
                 None => {
-                    let server = match review_server_for_launch(&launch, &github_token) {
-                        Ok(server) => server,
-                        Err(message) => {
-                            let _ = tx.send(ReviewJobMessage::FinishedFailure {
+                    let backend_is_claude = review_launch_repo_path_and_settings(&launch)
+                        .map(|(_, settings)| {
+                            matches!(settings.backend, crate::domain::ReviewBackend::Claude)
+                        })
+                        .unwrap_or(false);
+                    if backend_is_claude {
+                        if worker_cancel_requested.load(Ordering::SeqCst) {
+                            let _ = tx.send(ReviewJobMessage::FinishedCancelled {
                                 thread_id: worker_thread_id.clone(),
                                 captured_at: Utc::now(),
                                 session_id: None,
-                                message,
+                                _message: "Review canceled by user.".to_owned(),
                             });
                             return;
                         }
-                    };
+                        String::new()
+                    } else {
+                        let server = match review_server_for_launch(&launch, &github_token) {
+                            Ok(server) => server,
+                            Err(message) => {
+                                let _ = tx.send(ReviewJobMessage::FinishedFailure {
+                                    thread_id: worker_thread_id.clone(),
+                                    captured_at: Utc::now(),
+                                    session_id: None,
+                                    message,
+                                });
+                                return;
+                            }
+                        };
 
-                    if worker_cancel_requested.load(Ordering::SeqCst) {
-                        let _ = tx.send(ReviewJobMessage::FinishedCancelled {
-                            thread_id: worker_thread_id.clone(),
-                            captured_at: Utc::now(),
-                            session_id: None,
-                            _message: "Review canceled by user.".to_owned(),
-                        });
-                        return;
-                    }
+                        if worker_cancel_requested.load(Ordering::SeqCst) {
+                            let _ = tx.send(ReviewJobMessage::FinishedCancelled {
+                                thread_id: worker_thread_id.clone(),
+                                captured_at: Utc::now(),
+                                session_id: None,
+                                _message: "Review canceled by user.".to_owned(),
+                            });
+                            return;
+                        }
 
-                    let attach_url = server.url().to_owned();
-                    if tx
-                        .send(ReviewJobMessage::ServerReady {
-                            thread_id: worker_thread_id.clone(),
-                            server,
-                        })
-                        .is_err()
-                    {
-                        return;
+                        let attach_url = server.url().to_owned();
+                        if tx
+                            .send(ReviewJobMessage::ServerReady {
+                                thread_id: worker_thread_id.clone(),
+                                server,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        attach_url
                     }
-                    attach_url
                 }
             };
 
@@ -1373,6 +1391,16 @@ fn run_custom_review(
     review_settings: &ReviewCommandSettings,
     github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    if matches!(review_settings.backend, crate::domain::ReviewBackend::Claude) {
+        return crate::app::review_claude::run_custom_review(
+            context,
+            repo_path,
+            pr_number,
+            pr_url,
+            review_settings,
+            github_token,
+        );
+    }
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -1411,6 +1439,16 @@ fn run_pr_description(
     review_settings: &ReviewCommandSettings,
     github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    if matches!(review_settings.backend, crate::domain::ReviewBackend::Claude) {
+        return crate::app::review_claude::run_pr_description(
+            context,
+            repo_path,
+            pr_number,
+            pr_url,
+            review_settings,
+            github_token,
+        );
+    }
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -1452,6 +1490,16 @@ fn run_review_follow_up(
     review_settings: &ReviewCommandSettings,
     github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    if matches!(review_settings.backend, crate::domain::ReviewBackend::Claude) {
+        return crate::app::review_claude::run_review_follow_up(
+            context,
+            repo_path,
+            session_id,
+            prompt,
+            review_settings,
+            github_token,
+        );
+    }
     let mut command = Command::new("opencode");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
