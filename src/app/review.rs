@@ -188,7 +188,7 @@ pub(super) struct ReviewJob {
     cancel_requested: Arc<AtomicBool>,
 }
 
-enum ReviewRunOutcome {
+pub(super) enum ReviewRunOutcome {
     Completed {
         session_id: Option<String>,
     },
@@ -198,9 +198,9 @@ enum ReviewRunOutcome {
     },
 }
 
-struct ReviewRunFailure {
-    message: String,
-    session_id: Option<String>,
+pub(super) struct ReviewRunFailure {
+    pub(super) message: String,
+    pub(super) session_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -220,13 +220,13 @@ struct ReviewShellMirror {
     review_label: String,
 }
 
-struct ReviewRunContext<'a> {
-    tx: &'a mpsc::Sender<ReviewJobMessage>,
-    thread_id: &'a str,
-    review_label: &'a str,
-    attach_url: &'a str,
-    child_handle: Arc<Mutex<Option<Child>>>,
-    cancel_requested: Arc<AtomicBool>,
+pub(super) struct ReviewRunContext<'a> {
+    pub(super) tx: &'a mpsc::Sender<ReviewJobMessage>,
+    pub(super) thread_id: &'a str,
+    pub(super) review_label: &'a str,
+    pub(super) attach_url: &'a str,
+    pub(super) child_handle: Arc<Mutex<Option<Child>>>,
+    pub(super) cancel_requested: Arc<AtomicBool>,
 }
 
 impl Drop for ReviewServer {
@@ -1617,7 +1617,7 @@ fn read_review_json_stream(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stream_review_command(
+pub(super) fn stream_review_command(
     tx: &mpsc::Sender<ReviewJobMessage>,
     thread_id: &str,
     review_label: &str,
@@ -2170,7 +2170,7 @@ fn custom_command_prompt_message(pr_url: &str, pr_number: u64) -> String {
     format!("PR URL: {pr_url}\nPR number: {pr_number}")
 }
 
-fn review_command_envs(
+pub(super) fn review_command_envs(
     review_settings: &ReviewCommandSettings,
     github_token: &str,
 ) -> Vec<(String, String)> {

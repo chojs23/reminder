@@ -99,6 +99,132 @@ fn summarize_tool_input(input: &Value) -> String {
     }
 }
 
+use std::process::{Command, Stdio};
+
+use crate::domain::{ReviewBackend, ReviewCommandSettings};
+
+use super::review::{
+    ReviewRunContext, ReviewRunFailure, ReviewRunOutcome, review_command_envs,
+    stream_review_command,
+};
+
+const CUSTOM_REVIEW_COMMAND_NAME: &str = "review-pr";
+const CUSTOM_PR_DESCRIPTION_COMMAND_NAME: &str = "pr-description";
+
+fn custom_command_prompt_message(pr_url: &str, pr_number: u64) -> String {
+    format!("/{CUSTOM_REVIEW_COMMAND_NAME} {pr_url} {pr_number}")
+}
+
+fn pr_description_prompt_message(pr_url: &str, pr_number: u64) -> String {
+    format!("/{CUSTOM_PR_DESCRIPTION_COMMAND_NAME} {pr_url} {pr_number}")
+}
+
+fn base_claude_command(
+    repo_path: &str,
+    review_settings: &ReviewCommandSettings,
+    github_token: &str,
+) -> Command {
+    let mut command = Command::new("claude");
+    command.current_dir(repo_path);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.envs(review_command_envs(review_settings, github_token));
+    command.arg("-p");
+    command
+}
+
+fn apply_stream_flags(command: &mut Command) {
+    command.arg("--output-format");
+    command.arg("stream-json");
+    command.arg("--verbose");
+}
+
+pub(super) fn run_custom_review(
+    context: ReviewRunContext<'_>,
+    repo_path: &str,
+    pr_number: u64,
+    pr_url: &str,
+    review_settings: &ReviewCommandSettings,
+    github_token: &str,
+) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    let mut command = base_claude_command(repo_path, review_settings, github_token);
+    command.arg(custom_command_prompt_message(pr_url, pr_number));
+    apply_stream_flags(&mut command);
+    command.args(&review_settings.additional_args);
+    println!(
+        "Running claude review command for {}",
+        context.review_label
+    );
+    stream_review_command(
+        context.tx,
+        context.thread_id,
+        context.review_label,
+        context.attach_url,
+        command,
+        context.child_handle,
+        context.cancel_requested,
+        ReviewBackend::Claude,
+    )
+}
+
+pub(super) fn run_pr_description(
+    context: ReviewRunContext<'_>,
+    repo_path: &str,
+    pr_number: u64,
+    pr_url: &str,
+    review_settings: &ReviewCommandSettings,
+    github_token: &str,
+) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    let mut command = base_claude_command(repo_path, review_settings, github_token);
+    command.arg(pr_description_prompt_message(pr_url, pr_number));
+    apply_stream_flags(&mut command);
+    command.args(&review_settings.additional_args);
+    println!(
+        "Running claude PR description command for {}",
+        context.review_label
+    );
+    stream_review_command(
+        context.tx,
+        context.thread_id,
+        context.review_label,
+        context.attach_url,
+        command,
+        context.child_handle,
+        context.cancel_requested,
+        ReviewBackend::Claude,
+    )
+}
+
+pub(super) fn run_review_follow_up(
+    context: ReviewRunContext<'_>,
+    repo_path: &str,
+    session_id: &str,
+    prompt: &str,
+    review_settings: &ReviewCommandSettings,
+    github_token: &str,
+) -> Result<ReviewRunOutcome, ReviewRunFailure> {
+    let mut command = base_claude_command(repo_path, review_settings, github_token);
+    command.arg(prompt);
+    command.arg("--resume");
+    command.arg(session_id);
+    apply_stream_flags(&mut command);
+    println!(
+        "Running claude follow-up for {}",
+        context.review_label
+    );
+    stream_review_command(
+        context.tx,
+        context.thread_id,
+        context.review_label,
+        context.attach_url,
+        command,
+        context.child_handle,
+        context.cancel_requested,
+        ReviewBackend::Claude,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
