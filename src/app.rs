@@ -3,6 +3,7 @@ mod notification_state;
 mod repo_paths;
 mod repo_state;
 mod review;
+mod review_claude;
 mod scheduler;
 mod search;
 mod state;
