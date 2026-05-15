@@ -1561,10 +1561,10 @@ fn read_review_json_stream(
                         }
                     };
                 }
-                if matches!(backend, crate::domain::ReviewBackend::Opencode) {
-                    if let Some(part_id) = review_event_part_id(&event) {
-                        capture.seen_part_ids.insert(part_id.to_owned());
-                    }
+                if matches!(backend, crate::domain::ReviewBackend::Opencode)
+                    && let Some(part_id) = review_event_part_id(&event)
+                {
+                    capture.seen_part_ids.insert(part_id.to_owned());
                 }
                 match backend {
                     crate::domain::ReviewBackend::Opencode => render_review_json_event(&event),
@@ -1594,10 +1594,10 @@ fn read_review_json_stream(
                     }
                 };
             }
-            if matches!(backend, crate::domain::ReviewBackend::Opencode) {
-                if let Some(part_id) = review_event_part_id(&event) {
-                    capture.seen_part_ids.insert(part_id.to_owned());
-                }
+            if matches!(backend, crate::domain::ReviewBackend::Opencode)
+                && let Some(part_id) = review_event_part_id(&event)
+            {
+                capture.seen_part_ids.insert(part_id.to_owned());
             }
             match backend {
                 crate::domain::ReviewBackend::Opencode => render_review_json_event(&event),
@@ -1616,6 +1616,7 @@ fn read_review_json_stream(
     Ok(capture)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_review_command(
     tx: &mpsc::Sender<ReviewJobMessage>,
     thread_id: &str,
@@ -1785,22 +1786,22 @@ fn stream_review_command(
     }
 
     if status.success() {
-        if matches!(backend, crate::domain::ReviewBackend::Opencode) {
-            if let Some(session_id) = stdout_capture.session_id.clone() {
-                wait_for_review_session_settle(
-                    &mut stdout_capture,
-                    &shell_mirror,
-                    tx,
-                    thread_id,
-                    attach_url,
-                    &session_id,
-                    &cancel_requested,
-                )
-                .map_err(|message| ReviewRunFailure {
-                    message,
-                    session_id: Some(session_id),
-                })?;
-            }
+        if matches!(backend, crate::domain::ReviewBackend::Opencode)
+            && let Some(session_id) = stdout_capture.session_id.clone()
+        {
+            wait_for_review_session_settle(
+                &mut stdout_capture,
+                &shell_mirror,
+                tx,
+                thread_id,
+                attach_url,
+                &session_id,
+                &cancel_requested,
+            )
+            .map_err(|message| ReviewRunFailure {
+                message,
+                session_id: Some(session_id),
+            })?;
         }
         finish_review_shell_stream(&shell_mirror, tx, thread_id, "session ready");
         return Ok(ReviewRunOutcome::Completed {
