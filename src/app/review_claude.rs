@@ -107,15 +107,13 @@ use super::review::{
     ReviewRunContext, ReviewRunFailure, ReviewRunOutcome, review_command_envs,
     stream_review_command,
 };
+use super::{CUSTOM_PR_DESCRIPTION_COMMAND_NAME, CUSTOM_REVIEW_COMMAND_NAME};
 
-const CUSTOM_REVIEW_COMMAND_NAME: &str = "review-pr";
-const CUSTOM_PR_DESCRIPTION_COMMAND_NAME: &str = "pr-description";
-
-fn custom_command_prompt_message(pr_url: &str, pr_number: u64) -> String {
+fn custom_review_slash_prompt(pr_url: &str, pr_number: u64) -> String {
     format!("/{CUSTOM_REVIEW_COMMAND_NAME} {pr_url} {pr_number}")
 }
 
-fn pr_description_prompt_message(pr_url: &str, pr_number: u64) -> String {
+fn pr_description_slash_prompt(pr_url: &str, pr_number: u64) -> String {
     format!("/{CUSTOM_PR_DESCRIPTION_COMMAND_NAME} {pr_url} {pr_number}")
 }
 
@@ -149,7 +147,7 @@ pub(super) fn run_custom_review(
     github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut command = base_claude_command(repo_path, review_settings, github_token);
-    command.arg(custom_command_prompt_message(pr_url, pr_number));
+    command.arg(custom_review_slash_prompt(pr_url, pr_number));
     apply_stream_flags(&mut command);
     command.args(&review_settings.additional_args);
     println!(
@@ -177,7 +175,7 @@ pub(super) fn run_pr_description(
     github_token: &str,
 ) -> Result<ReviewRunOutcome, ReviewRunFailure> {
     let mut command = base_claude_command(repo_path, review_settings, github_token);
-    command.arg(pr_description_prompt_message(pr_url, pr_number));
+    command.arg(pr_description_slash_prompt(pr_url, pr_number));
     apply_stream_flags(&mut command);
     command.args(&review_settings.additional_args);
     println!(
@@ -208,6 +206,7 @@ pub(super) fn run_review_follow_up(
     command.arg(prompt);
     command.arg("--resume");
     command.arg(session_id);
+    // Follow-ups omit additional_args to match the opencode follow-up shape (review.rs).
     apply_stream_flags(&mut command);
     println!(
         "Running claude follow-up for {}",
