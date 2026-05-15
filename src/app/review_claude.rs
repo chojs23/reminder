@@ -99,7 +99,9 @@ fn summarize_tool_input(input: &Value) -> String {
     }
 }
 
+use std::env;
 use std::fs;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use crate::domain::{ReviewBackend, ReviewCommandSettings};
@@ -116,6 +118,30 @@ fn custom_review_slash_prompt(pr_url: &str, pr_number: u64) -> String {
 
 fn pr_description_slash_prompt(pr_url: &str, pr_number: u64) -> String {
     format!("/{CUSTOM_PR_DESCRIPTION_COMMAND_NAME} {pr_url} {pr_number}")
+}
+
+pub(super) fn default_review_prompt_md_path_display() -> String {
+    default_review_prompt_md_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Unavailable (set HOME)".to_owned())
+}
+
+pub(super) fn default_pr_description_prompt_md_path_display() -> String {
+    default_pr_description_prompt_md_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Unavailable (set HOME)".to_owned())
+}
+
+fn default_review_prompt_md_path() -> Option<PathBuf> {
+    env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".claude/commands/review-pr.md"))
+}
+
+fn default_pr_description_prompt_md_path() -> Option<PathBuf> {
+    env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".claude/commands/pr-description.md"))
 }
 
 fn prompt_from_md_or_slash(

@@ -568,18 +568,28 @@ impl ReminderApp {
                         .hint_text("--lang korean"),
                 );
                 ui.add_space(8.0);
+                let (review_hint, pr_description_hint) = match editor.backend {
+                    ReviewBackend::Opencode => (
+                        default_review_prompt_md_path_display(),
+                        default_pr_description_prompt_md_path_display(),
+                    ),
+                    ReviewBackend::Claude => (
+                        review_claude::default_review_prompt_md_path_display(),
+                        review_claude::default_pr_description_prompt_md_path_display(),
+                    ),
+                };
                 ui.label("Review prompt md path");
                 ui.add(
                     egui::TextEdit::singleline(&mut editor.review_prompt_md_path_text)
                         .desired_width(f32::INFINITY)
-                        .hint_text(default_review_prompt_md_path_display()),
+                        .hint_text(review_hint),
                 );
                 ui.add_space(8.0);
                 ui.label("PR Description md path");
                 ui.add(
                     egui::TextEdit::singleline(&mut editor.pr_description_md_path_text)
                         .desired_width(f32::INFINITY)
-                        .hint_text(default_pr_description_prompt_md_path_display()),
+                        .hint_text(pr_description_hint),
                 );
 
                 if let Some(error) = &editor.form_error {
